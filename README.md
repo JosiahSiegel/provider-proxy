@@ -280,6 +280,7 @@ node provider-proxy.js
 | Body patch not applied | Confirm request is JSON and uses `POST`, `PUT`, or `PATCH` |
 | Manifest can't reach proxy on `127.0.0.1` | Manifest may be in Docker — use `host.docker.internal` instead |
 | Container gets `Connection refused` on `host.docker.internal:<PROXY_PORT>` (Linux) | Proxy is bound loopback-only. Set `PROXY_BIND=0.0.0.0` and re-block the port at the host firewall. |
+| Container gets `curl: (28) Connection timed out` (not refused) on `host.docker.internal:<PROXY_PORT>` (Linux + UFW) | UFW is silently dropping the SYN from the compose network's bridge. Allow the subnet (`docker network inspect <net> --format '{{(index .IPAM.Config 0).Subnet}}'`) and **insert** the rule above the public deny — first match wins. `allow in on docker0` does not cover custom networks. |
 
 ## Security
 
