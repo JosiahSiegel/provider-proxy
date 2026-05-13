@@ -31,6 +31,7 @@ Required: either `TARGET_HOST` or `TARGETS`.
 
 Common optional environment variables:
 - `PROXY_PORT` — local port to bind (default: `9999`)
+- `PROXY_BIND` — local address to bind (default: `127.0.0.1`). Set to `0.0.0.0` only when the proxy must be reachable from a Docker bridge (the Linux `host.docker.internal` case) or another non-loopback peer. The host firewall then becomes the only barrier — keep `PROXY_PORT/tcp` blocked from the public internet.
 - `USER_AGENT` — User-Agent header to inject into all requests
 - `EXTRA_HEADERS` — JSON object of additional headers to inject into all requests
 - `DEBUG_PROXY=1` — log redacted upstream request URL, headers, and body summary
@@ -90,7 +91,7 @@ The protocol module (`http` vs `https`) is selected per-request via `getRequestM
 
 ### Security / Hardening
 
-- Binds to `127.0.0.1` only.
+- Defaults to binding `127.0.0.1` only. `PROXY_BIND` can widen this (e.g. `0.0.0.0` so a Linux Docker container can reach the host via `host.docker.internal`); when overridden, the proxy logs a warning at startup and the host firewall becomes the only barrier to remote access.
 - Strips proxy-chain headers (`x-forwarded-*`, `x-real-ip`, etc.) before forwarding.
 - Limits request body size to 10MB.
 - Handles client disconnects (`req.on('aborted')`) to prevent upstream resource leaks.

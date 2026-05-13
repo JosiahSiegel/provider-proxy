@@ -14,6 +14,11 @@
 //                    e.g. TARGETS='[{"pathPrefix":"/kimi","host":"api.kimi.com"}]'
 //                    Each route: pathPrefix, host, protocol?, port?, headers?, stripPrefix?
 //   PROXY_PORT       Local port to bind (default: 9999)
+//   PROXY_BIND       Local address to bind (default: 127.0.0.1).
+//                    Set to 0.0.0.0 only when the proxy must accept connections
+//                    from a Docker bridge (e.g. host.docker.internal on Linux)
+//                    or another non-loopback peer. The host firewall is then the
+//                    only thing preventing remote access — keep it locked down.
 //   USER_AGENT       User-Agent header to inject (optional)
 //   EXTRA_HEADERS    JSON object of extra headers to inject (optional)
 //                    e.g. EXTRA_HEADERS='{"x-app":"cli","x-custom":"value"}'
@@ -22,6 +27,7 @@ const http = require("http");
 const https = require("https");
 
 const PROXY_PORT = parseInt(process.env.PROXY_PORT || "9999", 10);
+const PROXY_BIND = process.env.PROXY_BIND || "127.0.0.1";
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB
 const DEBUG_PROXY = process.env.DEBUG_PROXY === "1";
 const DEBUG_BODY = process.env.DEBUG_BODY === "1";
@@ -367,15 +373,20 @@ const server = http.createServer((req, res) => {
 
 server.on("error", (err) => {
   if (err.code === "EADDRINUSE") {
-    console.error(`Error: 127.0.0.1:${PROXY_PORT} is already in use.`);
+    console.error(`Error: ${PROXY_BIND}:${PROXY_PORT} is already in use.`);
     console.error(`Try: PROXY_PORT=${PROXY_PORT + 1} node provider-proxy.js`);
     process.exit(1);
   }
   throw err;
 });
 
-server.listen(PROXY_PORT, "127.0.0.1", () => {
-  console.log(`Provider proxy listening on http://127.0.0.1:${PROXY_PORT}`);
+server.listen(PROXY_PORT, PROXY_BIND, () => {
+  console.log(`Provider proxy listening on http://${PROXY_BIND}:${PROXY_PORT}`);
+  if (PROXY_BIND !== "127.0.0.1") {
+    console.log(
+      `Warning: bound to ${PROXY_BIND} (not loopback). Ensure the host firewall blocks ${PROXY_PORT}/tcp from untrusted networks.`
+    );
+  }
   if (DEFAULT_TARGET.host) {
     console.log(`Default target: ${DEFAULT_TARGET.protocol}://${DEFAULT_TARGET.host}:${DEFAULT_TARGET.port}`);
   }

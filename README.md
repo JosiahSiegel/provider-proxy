@@ -43,7 +43,7 @@ OpenCode -> Manifest -> proxy:9997 -> api.kimi.com
 
 Use this when **Manifest's outbound request** to the provider is what's being rejected — e.g. provider gates on coding-agent fingerprints that Manifest doesn't send. OpenCode continues to point at Manifest normally; only Manifest's provider config points at the proxy.
 
-**Docker networking note:** If Manifest runs in Docker and the proxy runs on your host, Manifest must use `host.docker.internal` instead of `127.0.0.1` to reach the proxy.
+**Docker networking note:** If Manifest runs in Docker and the proxy runs on your host, Manifest must use `host.docker.internal` instead of `127.0.0.1` to reach the proxy. On Linux this also requires `PROXY_BIND=0.0.0.0` (the default loopback bind refuses connections from the Docker bridge) and an `extra_hosts: ["host.docker.internal:host-gateway"]` entry on the consuming container. Lock the proxy port down at the host firewall when doing this — `0.0.0.0` listens on every interface.
 
 ## Multi-Target Routing
 
@@ -120,6 +120,7 @@ More patches can be added to `patchRequestBody()` in `provider-proxy.js`.
 | `TARGET_PROTOCOL` | No | `https` | `https` or `http` |
 | `TARGETS` | No | — | JSON array of route objects for multi-target routing (see below) |
 | `PROXY_PORT` | No | `9999` | Local port for the proxy |
+| `PROXY_BIND` | No | `127.0.0.1` | Local bind address. Set to `0.0.0.0` (or a specific docker bridge IP) when a Linux Docker container must reach the proxy via `host.docker.internal`. Loopback-only is the safe default — widening it exposes the port to anything the host firewall lets in. |
 | `USER_AGENT` | No | — | User-Agent header to inject |
 | `EXTRA_HEADERS` | No | — | JSON object of additional headers to inject |
 | `DEBUG_PROXY` | No | — | Set to `1` to log redacted upstream request URL, headers, and body summary |
@@ -278,10 +279,11 @@ node provider-proxy.js
 | Port already in use | Set `PROXY_PORT` to a different port and update your config |
 | Body patch not applied | Confirm request is JSON and uses `POST`, `PUT`, or `PATCH` |
 | Manifest can't reach proxy on `127.0.0.1` | Manifest may be in Docker — use `host.docker.internal` instead |
+| Container gets `Connection refused` on `host.docker.internal:<PROXY_PORT>` (Linux) | Proxy is bound loopback-only. Set `PROXY_BIND=0.0.0.0` and re-block the port at the host firewall. |
 
 ## Security
 
-- Binds to `127.0.0.1` only, not the network
+- Binds to `127.0.0.1` by default; `PROXY_BIND` can widen this when a Docker bridge needs access. Whenever `PROXY_BIND` is not loopback, the host firewall is the only barrier — block the proxy port from public interfaces.
 - Forwards only to configured targets (`TARGET_HOST` or routes in `TARGETS`)
 - Strips proxy-chain headers (`x-forwarded-*`, `x-real-ip`, etc.) before forwarding
 - Limits request body size to 10MB
