@@ -408,6 +408,7 @@ function appendAgySetupOutput(source, chunk) {
 }
 
 function startAgyInteractiveSetup() {
+  console.log(`[agy] setup start requested; usePty=${AGY_USE_PTY}; bin=${AGY_BIN}`);
   if (agySetupProcess) return { started: false, status: agySetupStatus };
   agySetupOutput = [];
   agySetupStatus = "running";
@@ -422,6 +423,7 @@ function startAgyInteractiveSetup() {
         env: process.env,
       });
       appendAgySetupOutput("system", `Started PTY ${AGY_BIN}\n`);
+      console.log(`[agy] setup started with PTY ${AGY_BIN}`);
       agySetupProcess.onData((data) => appendAgySetupOutput("pty", data));
       agySetupProcess.onExit(({ exitCode }) => {
         agySetupStatus = exitCode === 0 ? "completed" : `exited:${exitCode}`;
@@ -430,6 +432,7 @@ function startAgyInteractiveSetup() {
       });
       return { started: true, status: agySetupStatus, pty: true };
     } catch (err) {
+      console.error(`[agy] setup PTY failed: ${err.message}`);
       agySetupStatus = "error";
       appendAgySetupOutput("error", `${err.message}\n`);
       agySetupProcess = null;
@@ -439,6 +442,7 @@ function startAgyInteractiveSetup() {
 
   agySetupProcess = spawn(AGY_BIN, [], { windowsHide: false, env: process.env, shell: false });
   appendAgySetupOutput("system", `Started ${AGY_BIN}\n`);
+  console.log(`[agy] setup started with spawn ${AGY_BIN}`);
   agySetupProcess.stdout.on("data", (chunk) => appendAgySetupOutput("stdout", chunk));
   agySetupProcess.stderr.on("data", (chunk) => appendAgySetupOutput("stderr", chunk));
   agySetupProcess.on("error", (err) => {
@@ -472,6 +476,7 @@ function stripAnsi(value) {
 function runAgyWithPty(prompt, callback) {
   if (!AGY_USE_PTY) return false;
   const args = ["--print", prompt, "--print-timeout", `${Math.ceil(AGY_TIMEOUT_MS / 1000)}s`];
+  console.log("[agy] chat using PTY", AGY_BIN);
   if (AGY_DEBUG) console.log("[agy] pty", AGY_BIN, args.map((arg) => (arg === prompt ? "[PROMPT]" : arg)).join(" "));
 
   let child;
@@ -519,6 +524,7 @@ function runAgyWithPty(prompt, callback) {
 }
 
 function runAgy(prompt, callback) {
+  console.log(`[agy] chat request start; usePty=${AGY_USE_PTY}; bin=${AGY_BIN}; active=${agyActiveRequests}`);
   if (agyActiveRequests >= AGY_MAX_CONCURRENCY) {
     callback(new Error(`Too many active agy requests; AGY_MAX_CONCURRENCY=${AGY_MAX_CONCURRENCY}`));
     return;
@@ -526,6 +532,7 @@ function runAgy(prompt, callback) {
 
   agyActiveRequests += 1;
   if (runAgyWithPty(prompt, callback)) return;
+  console.log(`[agy] chat using spawn fallback ${AGY_BIN}`);
 
   const args = ["--print", prompt, "--print-timeout", `${Math.ceil(AGY_TIMEOUT_MS / 1000)}s`];
   if (AGY_DEBUG) console.log("[agy] spawn", AGY_BIN, args.map((arg) => (arg === prompt ? "[PROMPT]" : arg)).join(" "));
@@ -674,16 +681,29 @@ async function refresh() {
   document.getElementById('status').textContent = data.status || 'unreachable';
   document.getElementById('output').textContent = (data.output || []).map(e => '[' + e.time + '] ' + e.source + ': ' + e.text).join('');
 }
-async function startSetup() { await json('/setup/start', { method: 'POST' }); await refresh(); }
+async function startSetup() {
+  document.getElementById('status').textContent = 'starting...';
+  try {
+    const data = await json('/setup/start', { method: 'POST' });
+    document.getElementById('test').textContent = JSON.stringify(data, null, 2);
+  } catch (err) {
+    document.getElementById('test').textContent = String(err && err.stack ? err.stack : err);
+  }
+  await refresh();
+}
 async function stopSetup() { await json('/setup/stop', { method: 'POST' }); await refresh(); }
 async function runTest() {
   document.getElementById('test').textContent = 'running...';
-  const prompt = document.getElementById('prompt').value;
-  const data = await json('/v1/chat/completions', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: ${JSON.stringify(AGY_MODEL)}, messages: [{ role: 'user', content: prompt }] })
-  });
-  document.getElementById('test').textContent = JSON.stringify(data, null, 2);
+  try {
+    const prompt = document.getElementById('prompt').value;
+    const data = await json('/v1/chat/completions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: ${JSON.stringify(AGY_MODEL)}, messages: [{ role: 'user', content: prompt }] })
+    });
+    document.getElementById('test').textContent = JSON.stringify(data, null, 2);
+  } catch (err) {
+    document.getElementById('test').textContent = String(err && err.stack ? err.stack : err);
+  }
 }
 setInterval(refresh, 1500);
 refresh();
