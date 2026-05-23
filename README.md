@@ -103,7 +103,7 @@ These notes summarize current integration findings for using Google Gemini, Goog
 | Gemini Developer API | HTTPS API | API key from Google AI Studio | Public API surface at `generativelanguage.googleapis.com`; separate from consumer Gemini app subscription limits |
 | Gemini OpenAI-compatible API | OpenAI-compatible HTTPS API | `Authorization: Bearer <GEMINI_API_KEY>` | Base URL: `https://generativelanguage.googleapis.com/v1beta/openai/` |
 | Vertex AI Gemini | HTTPS API | Google Cloud IAM / ADC / service account | Enterprise Google Cloud surface at `aiplatform.googleapis.com` |
-| Google Antigravity / `agy` | Local CLI | Google OAuth persisted locally | No documented API-key auth or supported local HTTP server mode found during research |
+| Google Antigravity / `agy` | Local CLI | Google OAuth persisted locally | No documented official API-key auth or official local HTTP server mode found during research |
 | Official Gemini CLI (`gemini`) | Local CLI / headless stdout | Google OAuth, Gemini API key, or Vertex credentials | Separate from `agy`; not an OpenAI-compatible local HTTP provider by default |
 
 ### Manifest integration paths
@@ -159,7 +159,7 @@ https://antigravity.google/
 
 For subprocess-based integration, the local adapter must run as the same OS user that installed and authenticated `agy`, because the OAuth session is tied to that user's local credential store. If the adapter runs as a different account, such as `NT AUTHORITY\\SYSTEM`, install Antigravity/`agy` and complete login for that account too, or run the adapter under the already-authenticated user account.
 
-No supported API-key mode, custom endpoint mode, or OpenAI-compatible HTTP server mode was found.
+No official Antigravity-provided API-key mode, custom endpoint mode, or OpenAI-compatible HTTP server mode was found. The `/agy` route in this repo is a local subprocess-backed compatibility facade, not an official Antigravity server mode.
 
 Possible integration approaches, each with different tradeoffs:
 
@@ -174,7 +174,11 @@ Possible integration approaches, each with different tradeoffs:
 
 `provider-proxy.js` includes a built-in OpenAI-compatible `agy` route. It invokes `agy --print` for each chat request and can coexist with normal reverse-proxy routes on the same port.
 
-Run the proxy from a terminal where `agy --print` works:
+Install optional dependencies once, then run the proxy from a terminal where `agy --print` works:
+
+```bash
+npm install
+```
 
 ```powershell
 node D:\repos\provider-proxy\provider-proxy.js
@@ -203,6 +207,8 @@ http://host.docker.internal:9999/agy/v1
 
 The UI starts the interactive `agy` process from the same account running the proxy and shows captured output. On a VPS, access the UI over your private network, for example `http://<vps-tailnet-name>:9999/agy/`, and complete the Google login URL/code shown by `agy`. The OAuth session is stored for the OS user running `provider-proxy`; if systemd or `./stack autostart` runs the proxy as a different user, authenticate `agy` for that user too. After login, use the UI's OK test before pointing Manifest at the route.
 
+When publishing the setup UI through Tailscale Serve, prefer a private tailnet-only route. If Serve path-mounting causes requests to arrive as `/agy/agy/...`, the built-in route tolerates both direct `/agy/...` and duplicated `/agy/agy/...` forms.
+
 `provider-proxy.js` is the primary integrated path for `agy` because it lets the browser UI, `/agy/v1` provider endpoint, and normal reverse-proxy routes share one port. `agy-provider.js` remains available as a standalone server if you want to run the `agy` adapter on its own port. Its default base URL is `http://127.0.0.1:9996/v1`.
 
 Optional environment variables:
@@ -217,12 +223,13 @@ Optional environment variables:
 | `AGY_MAX_CONCURRENCY` | `1` | Maximum concurrent `agy` subprocesses |
 | `AGY_PROVIDER_API_KEY` | unset | Optional bearer token required from clients |
 | `AGY_USE_PTY` | enabled when `node-pty` is installed | Set to `0` to force plain `child_process.spawn` |
+| `AGY_ARG_PROMPT_MAX_BYTES` | `16000` | Prompts above this size are written to a temporary file so `agy --print` receives a short argv prompt and avoids OS argument-length limits |
 | `AGY_DEBUG` | unset | Set to `1` for subprocess diagnostics |
 
 Example with an explicit binary path:
 
 ```powershell
-$env:AGY_BIN = "C:\Windows\System32\config\systemprofile\AppData\Local\agy\bin\agy.exe"
+$env:AGY_BIN = "C:\Path\To\agy.exe"
 node D:\repos\provider-proxy\agy-provider.js
 ```
 
@@ -269,6 +276,7 @@ More patches can be added to `patchRequestBody()` in `provider-proxy.js`.
 | `provider-proxy.js` | Generic reverse proxy plus integrated `/agy` OpenAI-compatible local provider route |
 | `agy-provider.js` | Optional standalone OpenAI-compatible local provider that wraps `agy --print` |
 | `package.json` | Optional dependencies, including `node-pty` for PTY/ConPTY-backed `agy` support |
+| `package-lock.json` | Locked dependency graph for reproducible `npm install` in submodule deployments |
 | `opencode.json` | Example OpenCode provider config pointing at the local proxy |
 
 ## Usage
@@ -449,6 +457,8 @@ node provider-proxy.js
 ## Security
 
 - Binds to `127.0.0.1` by default; `PROXY_BIND` can widen this when a Docker bridge needs access. Whenever `PROXY_BIND` is not loopback, the host firewall is the only barrier — block the proxy port from public interfaces.
+- Keep `/agy` private to localhost or a trusted tailnet. Do not expose the setup UI through public Funnel or other unauthenticated internet ingress.
+- Set `AGY_PROVIDER_API_KEY` if non-local clients can reach `/agy/v1`.
 - Forwards only to configured targets (`TARGET_HOST` or routes in `TARGETS`) and built-in local routes such as `/agy`
 - Strips proxy-chain headers (`x-forwarded-*`, `x-real-ip`, etc.) before forwarding
 - Limits request body size to 10MB

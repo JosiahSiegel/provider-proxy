@@ -26,6 +26,8 @@
 const http = require("http");
 const https = require("https");
 const fs = require("fs");
+const os = require("os");
+const path = require("path");
 const { spawn } = require("child_process");
 
 let pty = null;
@@ -47,12 +49,8 @@ const AGY_PROVIDER_API_KEY = process.env.AGY_PROVIDER_API_KEY;
 const AGY_MODEL = process.env.AGY_MODEL || "agy/antigravity";
 const AGY_DEBUG = process.env.AGY_DEBUG === "1";
 const AGY_USE_PTY = process.env.AGY_USE_PTY !== "0" && Boolean(pty);
-const AGY_CANDIDATE_BINS = [
-  process.env.AGY_BIN,
-  "C:\\Users\\josia\\AppData\\Local\\agy\\bin\\agy.exe",
-  "C:\\Windows\\System32\\config\\systemprofile\\AppData\\Local\\agy\\bin\\agy.exe",
-  "agy",
-];
+const AGY_ARG_PROMPT_MAX_BYTES = parseInt(process.env.AGY_ARG_PROMPT_MAX_BYTES || "16000", 10);
+const AGY_CANDIDATE_BINS = [process.env.AGY_BIN, "agy"];
 const AGY_BIN = AGY_CANDIDATE_BINS.find((p) => p && (p === "agy" || fs.existsSync(p))) || "agy";
 
 let agyActiveRequests = 0;
@@ -473,11 +471,35 @@ function stripAnsi(value) {
     .replace(/\r/g, "");
 }
 
+function createAgyPromptInvocation(prompt) {
+  if (Buffer.byteLength(prompt, "utf-8") <= AGY_ARG_PROMPT_MAX_BYTES) {
+    return { promptArg: prompt, promptFile: null };
+  }
+
+  const promptDir = fs.mkdtempSync(path.join(os.tmpdir(), "provider-proxy-agy-"));
+  const promptFile = path.join(promptDir, "prompt.txt");
+  fs.writeFileSync(promptFile, prompt, "utf-8");
+  return {
+    promptArg: `Read the full prompt from this UTF-8 text file and respond to it exactly as instructed inside the file: ${promptFile}`,
+    promptFile,
+  };
+}
+
+function cleanupAgyPromptFile(promptFile) {
+  if (!promptFile) return;
+  try {
+    fs.rmSync(path.dirname(promptFile), { recursive: true, force: true });
+  } catch (err) {
+    if (AGY_DEBUG) console.error("[agy] failed to remove prompt file", err.message);
+  }
+}
+
 function runAgyWithPty(prompt, callback) {
   if (!AGY_USE_PTY) return false;
-  const args = ["--print", prompt, "--print-timeout", `${Math.ceil(AGY_TIMEOUT_MS / 1000)}s`];
-  console.log("[agy] chat using PTY", AGY_BIN);
-  if (AGY_DEBUG) console.log("[agy] pty", AGY_BIN, args.map((arg) => (arg === prompt ? "[PROMPT]" : arg)).join(" "));
+  const invocation = createAgyPromptInvocation(prompt);
+  const args = ["--print", invocation.promptArg, "--print-timeout", `${Math.ceil(AGY_TIMEOUT_MS / 1000)}s`];
+  console.log("[agy] chat using PTY", AGY_BIN, invocation.promptFile ? "file" : "argv");
+  if (AGY_DEBUG) console.log("[agy] pty", AGY_BIN, args.map((arg) => (arg === invocation.promptArg ? "[PROMPT]" : arg)).join(" "));
 
   let child;
   try {
@@ -489,6 +511,7 @@ function runAgyWithPty(prompt, callback) {
       env: process.env,
     });
   } catch (err) {
+    cleanupAgyPromptFile(invocation.promptFile);
     agyActiveRequests -= 1;
     callback(err);
     return true;
@@ -509,6 +532,7 @@ function runAgyWithPty(prompt, callback) {
     if (settled) return;
     settled = true;
     clearTimeout(timer);
+    cleanupAgyPromptFile(invocation.promptFile);
     agyActiveRequests -= 1;
     const text = stripAnsi(output.join(""))
       .split("\n")
@@ -534,8 +558,9 @@ function runAgy(prompt, callback) {
   if (runAgyWithPty(prompt, callback)) return;
   console.log(`[agy] chat using spawn fallback ${AGY_BIN}`);
 
-  const args = ["--print", prompt, "--print-timeout", `${Math.ceil(AGY_TIMEOUT_MS / 1000)}s`];
-  if (AGY_DEBUG) console.log("[agy] spawn", AGY_BIN, args.map((arg) => (arg === prompt ? "[PROMPT]" : arg)).join(" "));
+  const invocation = createAgyPromptInvocation(prompt);
+  const args = ["--print", invocation.promptArg, "--print-timeout", `${Math.ceil(AGY_TIMEOUT_MS / 1000)}s`];
+  if (AGY_DEBUG) console.log("[agy] spawn", AGY_BIN, args.map((arg) => (arg === invocation.promptArg ? "[PROMPT]" : arg)).join(" "));
 
   const child = spawn(AGY_BIN, args, { windowsHide: true, env: process.env });
   const stdout = [];
@@ -545,6 +570,7 @@ function runAgy(prompt, callback) {
     if (settled) return;
     settled = true;
     child.kill("SIGTERM");
+    cleanupAgyPromptFile(invocation.promptFile);
     agyActiveRequests -= 1;
     callback(new Error(`agy timed out after ${AGY_TIMEOUT_MS}ms`));
   }, AGY_TIMEOUT_MS + 5000);
@@ -555,6 +581,7 @@ function runAgy(prompt, callback) {
     if (settled) return;
     settled = true;
     clearTimeout(timer);
+    cleanupAgyPromptFile(invocation.promptFile);
     agyActiveRequests -= 1;
     callback(err);
   });
@@ -562,6 +589,7 @@ function runAgy(prompt, callback) {
     if (settled) return;
     settled = true;
     clearTimeout(timer);
+    cleanupAgyPromptFile(invocation.promptFile);
     agyActiveRequests -= 1;
     const out = Buffer.concat(stdout).toString("utf-8").trim();
     const err = Buffer.concat(stderr).toString("utf-8").trim();

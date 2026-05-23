@@ -40,6 +40,7 @@ Common optional environment variables:
 - `AGY_BIN` — explicit `agy` binary path
 - `AGY_MODEL` — model ID returned by `/agy/v1/models` (default: `agy/antigravity`)
 - `AGY_USE_PTY=0` — disable PTY/ConPTY mode for `agy`
+- `AGY_ARG_PROMPT_MAX_BYTES` — prompts above this byte size are written to a temporary file and referenced by a short `agy --print` prompt to avoid OS argument-length limits
 
 ### Common Launch Examples
 
