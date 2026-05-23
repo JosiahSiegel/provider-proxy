@@ -627,7 +627,7 @@ function renderAgyUi() {
   <h2>Setup output</h2><pre id="output"></pre>
   <h2>Test result</h2><pre id="test"></pre>
 <script>
-const prefix = ${JSON.stringify(AGY_PATH_PREFIX)};
+const prefix = new URL('.', window.location.href).pathname.replace(/\/$/, '');
 async function json(path, options) {
   const response = await fetch(prefix + path, options);
   const text = await response.text();
