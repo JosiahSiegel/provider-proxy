@@ -627,16 +627,32 @@ function renderAgyUi() {
   <h2>Setup output</h2><pre id="output"></pre>
   <h2>Test result</h2><pre id="test"></pre>
 <script>
-const prefix = new URL('.', window.location.href).pathname.replace(/\/$/, '');
+const prefixes = Array.from(new Set([
+  new URL('.', window.location.href).pathname.replace(/\/$/, ''),
+  '',
+  ${JSON.stringify(AGY_PATH_PREFIX)}
+]));
+let activePrefix = null;
 async function json(path, options) {
-  const response = await fetch(prefix + path, options);
-  const text = await response.text();
-  try { return JSON.parse(text); } catch (_) { return { raw: text, status: response.status }; }
+  const candidates = activePrefix === null ? prefixes : [activePrefix];
+  let last = null;
+  for (const prefix of candidates) {
+    const response = await fetch(prefix + path, options);
+    const text = await response.text();
+    let data;
+    try { data = JSON.parse(text); } catch (_) { data = { raw: text, status: response.status }; }
+    if (response.ok) {
+      activePrefix = prefix;
+      return data;
+    }
+    last = data;
+  }
+  return last;
 }
 async function refresh() {
   const data = await json('/setup/status');
-  document.getElementById('status').textContent = data.status;
-  document.getElementById('output').textContent = data.output.map(e => '[' + e.time + '] ' + e.source + ': ' + e.text).join('');
+  document.getElementById('status').textContent = data.status || 'unreachable';
+  document.getElementById('output').textContent = (data.output || []).map(e => '[' + e.time + '] ' + e.source + ': ' + e.text).join('');
 }
 async function startSetup() { await json('/setup/start', { method: 'POST' }); await refresh(); }
 async function stopSetup() { await json('/setup/stop', { method: 'POST' }); await refresh(); }
