@@ -893,6 +893,8 @@ server.listen(PROXY_PORT, PROXY_BIND, () => {
   }
   console.log(`Built-in agy UI: http://${displayHost}:${PROXY_PORT}${AGY_PATH_PREFIX}/`);
   console.log(`Built-in agy OpenAI base URL: http://${displayHost}:${PROXY_PORT}${AGY_PATH_PREFIX}/v1`);
+  console.log(`Built-in agy binary: ${AGY_BIN}`);
+  console.log(`Built-in agy PTY: ${AGY_USE_PTY ? "enabled" : "disabled"}${pty ? "" : " (node-pty not available)"}`);
   if (TARGET_ROUTES.length === 0) {
     console.log(`\nSet in opencode.json:`);
     console.log(`  "baseURL": "http://${displayHost}:${PROXY_PORT}/v1"`);
