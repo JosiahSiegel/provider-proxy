@@ -694,32 +694,34 @@ function handleAgyChatCompletions(req, res) {
 }
 
 function handleAgyRoute(req, res, pathname) {
-  if (req.method === "GET" && (pathname === AGY_PATH_PREFIX || pathname === `${AGY_PATH_PREFIX}/`)) {
+  const agyPaths = [AGY_PATH_PREFIX, `${AGY_PATH_PREFIX}${AGY_PATH_PREFIX}`];
+
+  if (req.method === "GET" && agyPaths.some((prefix) => pathname === prefix || pathname === `${prefix}/`)) {
     sendHtml(res, 200, renderAgyUi());
     return true;
   }
-  if (req.method === "POST" && pathname === `${AGY_PATH_PREFIX}/setup/start`) {
+  if (req.method === "POST" && agyPaths.some((prefix) => pathname === `${prefix}/setup/start`)) {
     sendJson(res, 200, startAgyInteractiveSetup());
     return true;
   }
-  if (req.method === "POST" && pathname === `${AGY_PATH_PREFIX}/setup/stop`) {
+  if (req.method === "POST" && agyPaths.some((prefix) => pathname === `${prefix}/setup/stop`)) {
     sendJson(res, 200, { stopped: stopAgyInteractiveSetup(), status: agySetupStatus });
     return true;
   }
-  if (req.method === "GET" && pathname === `${AGY_PATH_PREFIX}/setup/status`) {
+  if (req.method === "GET" && agyPaths.some((prefix) => pathname === `${prefix}/setup/status`)) {
     sendJson(res, 200, { status: agySetupStatus, running: Boolean(agySetupProcess), output: agySetupOutput });
     return true;
   }
-  if (req.method === "GET" && pathname === `${AGY_PATH_PREFIX}/health`) {
+  if (req.method === "GET" && agyPaths.some((prefix) => pathname === `${prefix}/health`)) {
     sendJson(res, 200, { status: "ok", agyBin: AGY_BIN, activeRequests: agyActiveRequests, usePty: AGY_USE_PTY });
     return true;
   }
-  if (req.method === "GET" && pathname === `${AGY_PATH_PREFIX}/v1/models`) {
+  if (req.method === "GET" && agyPaths.some((prefix) => pathname === `${prefix}/v1/models`)) {
     if (!authenticateAgy(req, res)) return true;
     sendJson(res, 200, { object: "list", data: [{ id: AGY_MODEL, object: "model", created: 0, owned_by: "antigravity" }] });
     return true;
   }
-  if (req.method === "POST" && pathname === `${AGY_PATH_PREFIX}/v1/chat/completions`) {
+  if (req.method === "POST" && agyPaths.some((prefix) => pathname === `${prefix}/v1/chat/completions`)) {
     handleAgyChatCompletions(req, res);
     return true;
   }
@@ -734,10 +736,14 @@ const server = http.createServer((req, res) => {
   }
 
   const parsedReqUrl = new URL(req.url, `http://127.0.0.1:${PROXY_PORT}`);
+  if (parsedReqUrl.pathname.includes(AGY_PATH_PREFIX)) {
+    console.log(`[agy] incoming ${req.method} ${parsedReqUrl.pathname}`);
+  }
   if (handleAgyRoute(req, res, parsedReqUrl.pathname)) return;
 
   const route = resolveRoute(req.url);
   if (!route) {
+    console.log(`[proxy] no route for ${req.method} ${req.url}`);
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "No upstream route matched", path: req.url }));
     return;
@@ -820,6 +826,7 @@ server.on("error", (err) => {
 });
 
 server.listen(PROXY_PORT, PROXY_BIND, () => {
+  const displayHost = PROXY_BIND === "0.0.0.0" ? "127.0.0.1" : PROXY_BIND;
   console.log(`Provider proxy listening on http://${PROXY_BIND}:${PROXY_PORT}`);
   if (PROXY_BIND !== "127.0.0.1") {
     console.log(
@@ -844,15 +851,15 @@ server.listen(PROXY_PORT, PROXY_BIND, () => {
       console.log(`  ${k}: ${v}`);
     }
   }
-  console.log(`Built-in agy UI: http://${PROXY_BIND}:${PROXY_PORT}${AGY_PATH_PREFIX}/`);
-  console.log(`Built-in agy OpenAI base URL: http://${PROXY_BIND}:${PROXY_PORT}${AGY_PATH_PREFIX}/v1`);
+  console.log(`Built-in agy UI: http://${displayHost}:${PROXY_PORT}${AGY_PATH_PREFIX}/`);
+  console.log(`Built-in agy OpenAI base URL: http://${displayHost}:${PROXY_PORT}${AGY_PATH_PREFIX}/v1`);
   if (TARGET_ROUTES.length === 0) {
     console.log(`\nSet in opencode.json:`);
-    console.log(`  "baseURL": "http://${PROXY_BIND}:${PROXY_PORT}/v1"`);
+    console.log(`  "baseURL": "http://${displayHost}:${PROXY_PORT}/v1"`);
   } else {
     console.log(`\nSet in opencode.json (example):`);
     for (const route of TARGET_ROUTES) {
-      console.log(`  "baseURL": "http://${PROXY_BIND}:${PROXY_PORT}${route.pathPrefix}/v1"`);
+      console.log(`  "baseURL": "http://${displayHost}:${PROXY_PORT}${route.pathPrefix}/v1"`);
     }
   }
 });
