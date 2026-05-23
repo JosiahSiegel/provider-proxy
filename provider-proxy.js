@@ -628,7 +628,7 @@ function renderAgyUi() {
   <h2>Test result</h2><pre id="test"></pre>
 <script>
 const prefixes = Array.from(new Set([
-  new URL('.', window.location.href).pathname.replace(/\/$/, ''),
+  new URL('.', window.location.href).pathname.replace(/\\/$/, ''),
   '',
   ${JSON.stringify(AGY_PATH_PREFIX)}
 ]));
