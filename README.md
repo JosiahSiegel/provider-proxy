@@ -18,6 +18,7 @@ The proxy can:
 - Strip hop-by-hop/proxy-chain headers
 - Patch JSON request bodies before forwarding
 - Forward responses unchanged
+- Serve a built-in OpenAI-compatible `agy` route under `/agy` for local Antigravity CLI access
 
 ## Placement Modes
 
@@ -91,6 +92,164 @@ Each route object supports:
 }
 ```
 
+## Gemini, Antigravity, and `agy` Integration Notes
+
+These notes summarize current integration findings for using Google Gemini, Google Antigravity, or the `agy` CLI with Manifest and this proxy. They are intended as implementation context, not as a decision to include or exclude any option.
+
+### Product surfaces
+
+| Surface | Integration shape | Auth observed/documented | Notes |
+|---------|-------------------|--------------------------|-------|
+| Gemini Developer API | HTTPS API | API key from Google AI Studio | Public API surface at `generativelanguage.googleapis.com`; separate from consumer Gemini app subscription limits |
+| Gemini OpenAI-compatible API | OpenAI-compatible HTTPS API | `Authorization: Bearer <GEMINI_API_KEY>` | Base URL: `https://generativelanguage.googleapis.com/v1beta/openai/` |
+| Vertex AI Gemini | HTTPS API | Google Cloud IAM / ADC / service account | Enterprise Google Cloud surface at `aiplatform.googleapis.com` |
+| Google Antigravity / `agy` | Local CLI | Google OAuth persisted locally | No documented API-key auth or supported local HTTP server mode found during research |
+| Official Gemini CLI (`gemini`) | Local CLI / headless stdout | Google OAuth, Gemini API key, or Vertex credentials | Separate from `agy`; not an OpenAI-compatible local HTTP provider by default |
+
+### Manifest integration paths
+
+Manifest supports provider configuration directly for Google Gemini API keys. For that path, this proxy is not necessarily required: Manifest can store the Gemini provider key and route requests itself.
+
+This proxy can still be placed in either supported mode when header injection, request patching, route multiplexing, or local observability is useful:
+
+- **Client → Proxy → Manifest**: use when the client needs request shaping before reaching Manifest.
+- **Manifest → Proxy → Gemini/OpenAI-compatible provider**: use when Manifest should target a local compatibility layer or when provider-bound requests need headers or body patches.
+
+### Gemini OpenAI-compatible endpoint via proxy
+
+Google's Gemini API includes an OpenAI-compatible endpoint that can be targeted by OpenAI-compatible clients or gateways:
+
+```text
+https://generativelanguage.googleapis.com/v1beta/openai/
+```
+
+A proxy route can forward OpenAI-style requests to that endpoint while injecting the Gemini API key:
+
+```bash
+TARGET_HOST=generativelanguage.googleapis.com \
+  TARGET_PROTOCOL=https \
+  PROXY_PORT=9998 \
+  EXTRA_HEADERS='{"Authorization":"Bearer YOUR_GEMINI_API_KEY"}' \
+  node provider-proxy.js
+```
+
+Use a client base URL that preserves the `/v1beta/openai` path, for example with multi-target routing:
+
+```bash
+TARGETS='[
+  {"pathPrefix":"/gemini-openai","host":"generativelanguage.googleapis.com","headers":{"Authorization":"Bearer YOUR_GEMINI_API_KEY"}}
+]' \
+PROXY_PORT=9999 \
+node provider-proxy.js
+```
+
+Then point the client or Manifest custom provider base URL at:
+
+```text
+http://127.0.0.1:9999/gemini-openai/v1beta/openai
+```
+
+### `agy` / Antigravity CLI integration considerations
+
+Current research found `agy` behaves as a local CLI authenticated through Google OAuth and local credential storage. The Antigravity site is:
+
+```text
+https://antigravity.google/
+```
+
+For subprocess-based integration, the local adapter must run as the same OS user that installed and authenticated `agy`, because the OAuth session is tied to that user's local credential store. If the adapter runs as a different account, such as `NT AUTHORITY\\SYSTEM`, install Antigravity/`agy` and complete login for that account too, or run the adapter under the already-authenticated user account.
+
+No supported API-key mode, custom endpoint mode, or OpenAI-compatible HTTP server mode was found.
+
+Possible integration approaches, each with different tradeoffs:
+
+| Approach | Shape | Considerations |
+|----------|-------|----------------|
+| Subprocess adapter | HTTP server calls `agy --print` / equivalent and converts responses | Preserves local OAuth session, but requires request/response translation, process management, timeout handling, concurrency control, and streaming design |
+| OAuth-backed provider adapter | Implement a provider adapter that obtains and refreshes OAuth tokens through a documented flow | Depends on availability of documented OAuth scopes/endpoints for the target backend |
+| Third-party Antigravity proxy | Run an existing community proxy that exposes Anthropic/OpenAI-compatible endpoints | May rely on reverse-engineered behavior; validate maintenance status, security posture, and provider terms before use |
+| Direct Gemini API provider | Use Google AI Studio API key or Vertex AI credentials | Uses documented API surfaces; quotas and billing follow Gemini API or Vertex AI rather than the consumer Antigravity/AI Pro subscription |
+
+### Built-in `agy` route
+
+`provider-proxy.js` includes a built-in OpenAI-compatible `agy` route. It invokes `agy --print` for each chat request and can coexist with normal reverse-proxy routes on the same port.
+
+Run the proxy from a terminal where `agy --print` works:
+
+```powershell
+node D:\repos\provider-proxy\provider-proxy.js
+```
+
+The built-in endpoints are:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /agy/` | Browser UI for setup and testing |
+| `GET /agy/health` | Basic adapter health check |
+| `GET /agy/v1/models` | Returns the configured synthetic model ID |
+| `POST /agy/v1/chat/completions` | Accepts OpenAI-compatible chat requests and returns OpenAI-compatible responses |
+
+Use this OpenAI-compatible base URL from the host:
+
+```text
+http://127.0.0.1:9999/agy/v1
+```
+
+If Manifest runs in Docker, use:
+
+```text
+http://host.docker.internal:9999/agy/v1
+```
+
+The UI starts the interactive `agy` process from the same account running the proxy and shows captured output. On a VPS, access the UI over your private network, for example `http://<vps-tailnet-name>:9999/agy/`, and complete the Google login URL/code shown by `agy`. The OAuth session is stored for the OS user running `provider-proxy`; if systemd or `./stack autostart` runs the proxy as a different user, authenticate `agy` for that user too. After login, use the UI's OK test before pointing Manifest at the route.
+
+`provider-proxy.js` is the primary integrated path for `agy` because it lets the browser UI, `/agy/v1` provider endpoint, and normal reverse-proxy routes share one port. `agy-provider.js` remains available as a standalone server if you want to run the `agy` adapter on its own port. Its default base URL is `http://127.0.0.1:9996/v1`.
+
+Optional environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AGY_PATH_PREFIX` | `/agy` | Built-in route prefix when using `provider-proxy.js` |
+| `AGY_PORT` | `9996` | Local adapter port when using standalone `agy-provider.js` |
+| `AGY_BIN` | User-profile `agy.exe` if present, then SYSTEM-profile `agy.exe`, otherwise `agy` | CLI binary to execute |
+| `AGY_MODEL` | `agy/antigravity` | Model ID returned to clients |
+| `AGY_TIMEOUT_MS` | `300000` | Per-request timeout |
+| `AGY_MAX_CONCURRENCY` | `1` | Maximum concurrent `agy` subprocesses |
+| `AGY_PROVIDER_API_KEY` | unset | Optional bearer token required from clients |
+| `AGY_USE_PTY` | enabled when `node-pty` is installed | Set to `0` to force plain `child_process.spawn` |
+| `AGY_DEBUG` | unset | Set to `1` for subprocess diagnostics |
+
+Example with an explicit binary path:
+
+```powershell
+$env:AGY_BIN = "C:\Windows\System32\config\systemprofile\AppData\Local\agy\bin\agy.exe"
+node D:\repos\provider-proxy\agy-provider.js
+```
+
+Manifest or any OpenAI-compatible client can then use:
+
+```text
+Base URL: http://127.0.0.1:9999/agy/v1
+Model: agy/antigravity
+```
+
+The adapter is intentionally subprocess-based. It does not extract OAuth tokens, reverse-engineer Cloud Code APIs, or require API keys for Antigravity. It relies on the same local `agy` session that works in the terminal running the adapter.
+
+On Windows, `agy` may require a real terminal instead of plain stdio pipes. This adapter uses `node-pty`/ConPTY when available so `agy` behaves like it does in PowerShell. If model calls hang with plain subprocess output, keep PTY mode enabled.
+
+### Industry-standard gateway patterns
+
+Common multi-provider gateway designs include:
+
+- **Provider-owned gateway credentials**: the gateway owns upstream API keys and exposes its own client keys.
+- **BYOK**: users provide upstream provider API keys, which the gateway stores and uses per request.
+- **OAuth authorization code with PKCE**: desktop or CLI login opens a browser and stores refresh credentials locally or in a trusted backend.
+- **OAuth device authorization grant**: headless login flow where the user authorizes on another device.
+- **OpenAI-compatible facade**: gateway exposes `/v1/chat/completions`, `/v1/responses`, or `/v1/messages` while translating to provider-native APIs.
+- **Provider-native adapter**: gateway maps directly to each upstream provider's native request and streaming format.
+
+For `agy`, the main open question is whether a supported provider-facing API contract exists beyond the local CLI. If not, an adapter would need to treat `agy` as a subprocess rather than a normal HTTP upstream.
+
 ## Auto-patching
 
 The proxy automatically fixes known provider-specific request body issues:
@@ -99,6 +258,7 @@ The proxy automatically fixes known provider-specific request body issues:
 |-------|--------------|
 | `thinking is enabled but reasoning_content is missing in assistant tool call message` | Injects `"reasoning_content": ""` into assistant messages when `thinking` is present |
 | Gemini `Invalid JSON payload received. Unknown name "exclusiveMinimum"` / `"ref"` in tool schemas | Removes unsupported JSON Schema keywords from `tools` (`exclusiveMinimum`, `exclusiveMaximum`, `$ref`, `ref`, `$schema`, `additionalProperties`) |
+| OpenAI-compatible providers reject Anthropic-style `thinking` | Removes the top-level `thinking` request field |
 
 More patches can be added to `patchRequestBody()` in `provider-proxy.js`.
 
@@ -106,7 +266,9 @@ More patches can be added to `patchRequestBody()` in `provider-proxy.js`.
 
 | File | Purpose |
 |------|---------|
-| `provider-proxy.js` | Generic proxy — configurable target host and headers via environment variables |
+| `provider-proxy.js` | Generic reverse proxy plus integrated `/agy` OpenAI-compatible local provider route |
+| `agy-provider.js` | Optional standalone OpenAI-compatible local provider that wraps `agy --print` |
+| `package.json` | Optional dependencies, including `node-pty` for PTY/ConPTY-backed `agy` support |
 | `opencode.json` | Example OpenCode provider config pointing at the local proxy |
 
 ## Usage
@@ -120,13 +282,13 @@ More patches can be added to `patchRequestBody()` in `provider-proxy.js`.
 | `TARGET_PROTOCOL` | No | `https` | `https` or `http` |
 | `TARGETS` | No | — | JSON array of route objects for multi-target routing (see below) |
 | `PROXY_PORT` | No | `9999` | Local port for the proxy |
-| `PROXY_BIND` | No | `127.0.0.1` | Local bind address. Set to `0.0.0.0` (or a specific docker bridge IP) when a Linux Docker container must reach the proxy via `host.docker.internal`. Loopback-only is the safe default — widening it exposes the port to anything the host firewall lets in. |
+| `PROXY_BIND` | No | `127.0.0.1` | Local bind address. Set to `0.0.0.0` or a specific Docker bridge IP only when a Linux Docker container must reach the proxy via `host.docker.internal`. Widening it exposes the port to anything the host firewall lets in. |
 | `USER_AGENT` | No | — | User-Agent header to inject |
 | `EXTRA_HEADERS` | No | — | JSON object of additional headers to inject |
 | `DEBUG_PROXY` | No | — | Set to `1` to log redacted upstream request URL, headers, and body summary |
 | `DEBUG_BODY` | No | — | Set to `1` with `DEBUG_PROXY=1` to log full request body; may include sensitive data |
 
-\* Either `TARGET_HOST` or `TARGETS` is required.
+\* Either `TARGET_HOST` or `TARGETS` is required for upstream reverse-proxy routes. Built-in routes such as `/agy` can run without either.
 
 ### 2. Start the proxy
 
@@ -225,7 +387,7 @@ OpenCode must be restarted to pick up any `baseURL` changes.
 Assume Git Bash on Windows.
 
 - **Node.js** must be installed and available in PATH
-- The proxy uses only Node.js built-in modules — no `npm install` required
+- Reverse-proxy-only use can run with Node.js built-in modules; PTY-backed `agy` support requires installed dependencies so `node-pty` is available
 - If port 9999 is taken, set `PROXY_PORT=8888` and update your client config
 
 **Mode A examples:**
@@ -274,18 +436,20 @@ node provider-proxy.js
 | Issue | Fix |
 |-------|-----|
 | `ECONNREFUSED 127.0.0.1:9999` | Start the proxy (`node provider-proxy.js`) |
-| `Error: Either TARGET_HOST or TARGETS environment variable is required` | Set `TARGET_HOST` or `TARGETS` before starting the proxy |
+| No upstream proxy route works | Set `TARGET_HOST` or `TARGETS`, or use a built-in route such as `/agy` |
 | Provider still rejects request | Check proxy logs, injected headers, and provider-specific requirements |
 | Port already in use | Set `PROXY_PORT` to a different port and update your config |
 | Body patch not applied | Confirm request is JSON and uses `POST`, `PUT`, or `PATCH` |
 | Manifest can't reach proxy on `127.0.0.1` | Manifest may be in Docker — use `host.docker.internal` instead |
 | Container gets `Connection refused` on `host.docker.internal:<PROXY_PORT>` (Linux) | Proxy is bound loopback-only. Set `PROXY_BIND=0.0.0.0` and re-block the port at the host firewall. |
-| Container gets `curl: (28) Connection timed out` (not refused) on `host.docker.internal:<PROXY_PORT>` (Linux + UFW) | UFW is silently dropping the SYN from the compose network's bridge. Allow the subnet (`docker network inspect <net> --format '{{(index .IPAM.Config 0).Subnet}}'`) and **insert** the rule above the public deny — first match wins. `allow in on docker0` does not cover custom networks. |
+| Container gets `curl: (28) Connection timed out` (Linux + UFW) | UFW is dropping the SYN from the compose network. Allow the subnet and insert the allow rule above the public deny. |
+| `/agy/v1/chat/completions` hangs or returns no output | Confirm `agy --print "Reply with OK"` works in the same terminal/account running the proxy |
+| `/agy` PTY mode is unavailable | Run `npm install` in this repo so `node-pty` is installed, or set `AGY_USE_PTY=0` to force plain pipes |
 
 ## Security
 
 - Binds to `127.0.0.1` by default; `PROXY_BIND` can widen this when a Docker bridge needs access. Whenever `PROXY_BIND` is not loopback, the host firewall is the only barrier — block the proxy port from public interfaces.
-- Forwards only to configured targets (`TARGET_HOST` or routes in `TARGETS`)
+- Forwards only to configured targets (`TARGET_HOST` or routes in `TARGETS`) and built-in local routes such as `/agy`
 - Strips proxy-chain headers (`x-forwarded-*`, `x-real-ip`, etc.) before forwarding
 - Limits request body size to 10MB
 - Handles client disconnects to prevent upstream resource leaks

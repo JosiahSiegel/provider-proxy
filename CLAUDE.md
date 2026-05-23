@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a lightweight, single-file Node.js reverse proxy (`provider-proxy.js`) for routing AI client requests through a local header/body patching layer before they reach an upstream provider. It is used with OpenCode when a client cannot pass provider-required headers directly, or when an upstream provider needs small request-body compatibility fixes.
+This is a lightweight Node.js reverse proxy (`provider-proxy.js`) for routing AI client requests through a local header/body patching layer before they reach an upstream provider. It is used with OpenCode when a client cannot pass provider-required headers directly, or when an upstream provider needs small request-body compatibility fixes.
 
-The proxy uses only Node.js built-in modules (`http`, `https`) — no `npm install` is required to run it.
+`provider-proxy.js` also includes a built-in OpenAI-compatible `/agy` route that wraps the local Antigravity `agy --print` CLI. Reverse-proxy-only use relies on Node.js built-in modules; PTY-backed `agy` support requires installed dependencies so `node-pty` is available.
 
 ## Running the Proxy
 
@@ -16,7 +16,7 @@ There is no build step, test suite, or linter. Start the proxy directly:
 node provider-proxy.js
 ```
 
-Required: either `TARGET_HOST` or `TARGETS`.
+Required for upstream proxying: either `TARGET_HOST` or `TARGETS`. Built-in routes such as `/agy` can run without either.
 
 **Single-target mode:**
 - `TARGET_HOST` — upstream provider hostname (e.g. `app.manifest.build`)
@@ -36,6 +36,10 @@ Common optional environment variables:
 - `EXTRA_HEADERS` — JSON object of additional headers to inject into all requests
 - `DEBUG_PROXY=1` — log redacted upstream request URL, headers, and body summary
 - `DEBUG_BODY=1` — log full request body (requires `DEBUG_PROXY=1`)
+- `AGY_PATH_PREFIX` — built-in agy route prefix (default: `/agy`)
+- `AGY_BIN` — explicit `agy` binary path
+- `AGY_MODEL` — model ID returned by `/agy/v1/models` (default: `agy/antigravity`)
+- `AGY_USE_PTY=0` — disable PTY/ConPTY mode for `agy`
 
 ### Common Launch Examples
 
@@ -71,21 +75,30 @@ node provider-proxy.js
 ```
 OpenCode then points at `http://127.0.0.1:9999/kimi/v1` or `http://127.0.0.1:9999/openai/v1`.
 
+**Built-in agy provider:**
+```bash
+PROXY_PORT=9997 node provider-proxy.js
+```
+The browser UI is `http://127.0.0.1:9997/agy/`. Host clients use `http://127.0.0.1:9997/agy/v1`; Dockerized Manifest uses `http://host.docker.internal:9997/agy/v1`.
+
 ## Architecture
 
-`provider-proxy.js` implements a stateless reverse proxy with two code paths:
+`provider-proxy.js` implements a stateless reverse proxy with two forwarded-request code paths plus one built-in local provider path:
 
-1. **Buffered + patched path** — for `POST`/`PUT`/`PATCH` requests with `application/json` bodies. The proxy buffers the body, applies provider-specific patches, then forwards with an explicit `Content-Length`.
-2. **Stream-through path** — for `GET`/`DELETE` and non-JSON bodies. The request is piped directly to the upstream without modification.
+1. **Built-in agy path** — requests matching `AGY_PATH_PREFIX` are handled locally before route resolution. This serves the setup UI, health endpoint, model list, and `/v1/chat/completions` backed by `agy --print`.
+2. **Buffered + patched path** — for `POST`/`PUT`/`PATCH` requests with `application/json` bodies. The proxy buffers the body, applies provider-specific patches, then forwards with an explicit `Content-Length`.
+3. **Stream-through path** — for `GET`/`DELETE` and non-JSON bodies. The request is piped directly to the upstream without modification.
 
 ### Request Pipeline
 
-1. `resolveRoute(reqPath)` — matches the request URL against `TARGET_ROUTES` by `pathPrefix`. Falls back to `DEFAULT_TARGET` (from `TARGET_HOST`) if no route matches. Returns `404` when neither is configured.
-2. `buildOptions(req, route)` — parses the incoming URL, strips the matched `pathPrefix` if `stripPrefix` is enabled, copies headers, injects `INJECTED_HEADERS` (global) merged with `route.headers` (per-route), strips hop-by-hop headers, and sets `host` to `route.host`.
-3. `patchRequestBody(bodyBuf, contentType)` — mutates JSON bodies to fix known provider issues:
+1. `handleAgyRoute(req, res, pathname)` — claims only paths under `AGY_PATH_PREFIX`, preserving `/openai`, `/kimi`, and other configured upstream routes.
+2. `resolveRoute(reqPath)` — matches the request URL against `TARGET_ROUTES` by `pathPrefix`. Falls back to `DEFAULT_TARGET` (from `TARGET_HOST`) if no route matches. Returns `404` when neither is configured.
+3. `buildOptions(req, route)` — parses the incoming URL, strips the matched `pathPrefix` if `stripPrefix` is enabled, copies headers, injects `INJECTED_HEADERS` (global) merged with `route.headers` (per-route), strips hop-by-hop headers, and sets `host` to `route.host`.
+4. `patchRequestBody(bodyBuf, contentType)` — mutates JSON bodies to fix known provider issues:
    - Injects `"reasoning_content": ""` into assistant messages when `thinking` is enabled.
    - Removes unsupported JSON Schema keywords from `tools` (`exclusiveMinimum`, `exclusiveMaximum`, `$ref`, `ref`, `$schema`, `additionalProperties`) for Gemini compatibility.
-4. `forwardResponse(proxyRes, res)` — pipes the upstream response back to the client, stripping hop-by-hop headers.
+   - Removes the top-level `thinking` request field for OpenAI-compatible providers that reject it.
+5. `forwardResponse(proxyRes, res)` — pipes the upstream response back to the client, stripping hop-by-hop headers.
 
 The protocol module (`http` vs `https`) is selected per-request via `getRequestModule(route.protocol)`, so different routes can use different protocols.
 
@@ -100,7 +113,9 @@ The protocol module (`http` vs `https`) is selected per-request via `getRequestM
 
 | File | Purpose |
 |------|---------|
-| `provider-proxy.js` | The proxy server — configurable via environment variables |
+| `provider-proxy.js` | Reverse proxy plus integrated `/agy` OpenAI-compatible local provider route |
+| `agy-provider.js` | Optional standalone `agy --print` OpenAI-compatible adapter |
+| `package.json` | Optional dependencies, including `node-pty` for PTY/ConPTY-backed `agy` support |
 | `opencode.json` | Example OpenCode provider config pointing at the local proxy |
 
 ## Adding New Body Patches
