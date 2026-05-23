@@ -633,24 +633,44 @@ const prefixes = Array.from(new Set([
   ${JSON.stringify(AGY_PATH_PREFIX)}
 ]));
 let activePrefix = null;
-async function json(path, options) {
-  const candidates = activePrefix === null ? prefixes : [activePrefix];
+async function requestJson(prefix, path, options) {
+  const response = await fetch(prefix + path, options);
+  const text = await response.text();
+  let data;
+  try { data = JSON.parse(text); } catch (_) { data = { raw: text }; }
+  return { ok: response.ok, status: response.status, data, prefix };
+}
+async function discoverPrefix() {
+  const candidates = activePrefix === null ? prefixes : [activePrefix, ...prefixes.filter((prefix) => prefix !== activePrefix)];
   let last = null;
   for (const prefix of candidates) {
-    const response = await fetch(prefix + path, options);
-    const text = await response.text();
-    let data;
-    try { data = JSON.parse(text); } catch (_) { data = { raw: text, status: response.status }; }
-    if (response.ok) {
+    const result = await requestJson(prefix, '/setup/status');
+    if (result.ok && result.data && Array.isArray(result.data.output)) {
       activePrefix = prefix;
-      return data;
+      return result.data;
     }
-    last = data;
+    last = result;
   }
-  return last;
+  activePrefix = null;
+  return { status: 'unreachable', output: [], error: last && last.data };
+}
+async function json(path, options) {
+  if (activePrefix === null) await discoverPrefix();
+  const candidates = activePrefix === null ? prefixes : [activePrefix, ...prefixes.filter((prefix) => prefix !== activePrefix)];
+  let last = null;
+  for (const prefix of candidates) {
+    const result = await requestJson(prefix, path, options);
+    if (result.ok) {
+      activePrefix = prefix;
+      return result.data;
+    }
+    last = result;
+  }
+  activePrefix = null;
+  return last ? last.data : { error: 'request failed' };
 }
 async function refresh() {
-  const data = await json('/setup/status');
+  const data = await discoverPrefix();
   document.getElementById('status').textContent = data.status || 'unreachable';
   document.getElementById('output').textContent = (data.output || []).map(e => '[' + e.time + '] ' + e.source + ': ' + e.text).join('');
 }
