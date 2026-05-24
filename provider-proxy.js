@@ -364,18 +364,26 @@ function readJsonBody(req, res, callback) {
   req.on("error", (err) => sendOpenAiError(res, 400, err.message));
 }
 
+function stableJson(value) {
+  return JSON.stringify(value, null, 2);
+}
+
+function textFromContentPart(part) {
+  if (typeof part === "string") return part;
+  if (!part || typeof part !== "object") return part == null ? "" : String(part);
+  if (part.type === "text") return part.text || "";
+  if (part.type === "tool_use") return `[tool_use ${part.name || "unknown"}${part.id ? ` ${part.id}` : ""}]\n${stableJson(part.input || {})}`;
+  if (part.type === "tool_result") return `[tool_result${part.tool_use_id ? ` ${part.tool_use_id}` : ""}]\n${textFromContent(part.content)}`;
+  if (part.type === "thinking") return `[thinking]\n${part.thinking || ""}`;
+  if (part.type) return `[${part.type}]\n${stableJson(part)}`;
+  if (part.text) return part.text;
+  return stableJson(part);
+}
+
 function textFromContent(content) {
   if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return content == null ? "" : JSON.stringify(content);
-  return content
-    .map((part) => {
-      if (typeof part === "string") return part;
-      if (part?.type === "text") return part.text || "";
-      if (part?.text) return part.text;
-      return JSON.stringify(part);
-    })
-    .filter(Boolean)
-    .join("\n");
+  if (!Array.isArray(content)) return textFromContentPart(content);
+  return content.map(textFromContentPart).filter(Boolean).join("\n");
 }
 
 function buildAgyPrompt(body) {
@@ -383,17 +391,26 @@ function buildAgyPrompt(body) {
   if (messages.length === 0 && typeof body.prompt === "string") return body.prompt;
 
   const sections = [];
+  const system = Array.isArray(body.system) ? body.system.map(textFromContent).filter(Boolean).join("\n\n") : textFromContent(body.system);
+  if (system) sections.push(`SYSTEM:\n${system}`);
+
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    sections.push(`AVAILABLE TOOLS:\n${stableJson(body.tools)}`);
+  }
+
+  const requestSettings = {};
+  for (const key of ["thinking", "output_config", "context_management", "max_tokens", "metadata"]) {
+    if (body[key] !== undefined) requestSettings[key] = body[key];
+  }
+  if (Object.keys(requestSettings).length > 0) sections.push(`REQUEST SETTINGS:\n${stableJson(requestSettings)}`);
+
   for (const message of messages) {
     const role = message.role || "user";
     const content = textFromContent(message.content);
     if (content) sections.push(`${role.toUpperCase()}:\n${content}`);
     if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
-      sections.push(`${role.toUpperCase()} TOOL CALLS:\n${JSON.stringify(message.tool_calls, null, 2)}`);
+      sections.push(`${role.toUpperCase()} TOOL CALLS:\n${stableJson(message.tool_calls)}`);
     }
-  }
-
-  if (Array.isArray(body.tools) && body.tools.length > 0) {
-    sections.push(`AVAILABLE TOOLS:\n${JSON.stringify(body.tools, null, 2)}`);
   }
 
   return sections.join("\n\n").trim();
