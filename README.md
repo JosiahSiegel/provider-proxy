@@ -211,13 +211,57 @@ When publishing the setup UI through Tailscale Serve, prefer a private tailnet-o
 
 `provider-proxy.js` is the primary integrated path for `agy` because it lets the browser UI, `/agy/v1` provider endpoint, and normal reverse-proxy routes share one port. `agy-provider.js` remains available as a standalone server if you want to run the `agy` adapter on its own port. Its default base URL is `http://127.0.0.1:9996/v1`.
 
+### Local Windows setup with PM2
+
+Use this setup when `agy` is authenticated in your normal Windows user session and a remote Manifest instance needs to call the local `/agy` provider over Tailscale.
+
+1. Install dependencies and PM2:
+
+   ```powershell
+   cd D:\repos\provider-proxy
+   npm install
+   npm install -g pm2
+   ```
+
+2. Set `AGY_BIN` if `agy.exe` is not on PATH or if you want an explicit binary path:
+
+   ```powershell
+   [Environment]::SetEnvironmentVariable("AGY_BIN", "C:\Path\To\agy.exe", "User")
+   ```
+
+3. Start the proxy with the checked-in PM2 config:
+
+   ```powershell
+   cd D:\repos\provider-proxy
+   pm2 start ecosystem.config.cjs
+   pm2 save
+   ```
+
+   `ecosystem.config.cjs` starts `provider-proxy.js` on `PROXY_PORT=9999`, binds `PROXY_BIND=0.0.0.0` so Tailscale can reach it, and passes `AGY_BIN` from the user environment when set.
+
+4. Add a Windows Task Scheduler task that runs at logon under your user account and executes:
+
+   ```powershell
+   pm2 resurrect
+   ```
+
+   Run PM2 under the same Windows user that installed and authenticated Antigravity. Running as `SYSTEM` usually cannot see your user-session `agy` OAuth state.
+
+5. From the VPS or any tailnet peer, configure Manifest to use:
+
+   ```text
+   http://<windows-tailnet-name>:9999/agy/v1
+   ```
+
+Keep the Windows firewall restricted to trusted networks or Tailscale. `PROXY_BIND=0.0.0.0` is required for non-loopback reachability, but it also means the host firewall is the access boundary.
+
 Optional environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AGY_PATH_PREFIX` | `/agy` | Built-in route prefix when using `provider-proxy.js` |
 | `AGY_PORT` | `9996` | Local adapter port when using standalone `agy-provider.js` |
-| `AGY_BIN` | User-profile `agy.exe` if present, then SYSTEM-profile `agy.exe`, otherwise `agy` | CLI binary to execute |
+| `AGY_BIN` | `agy` | CLI binary to execute; set an explicit path such as `C:\Path\To\agy.exe` when needed |
 | `AGY_MODEL` | `agy/antigravity` | Model ID returned to clients |
 | `AGY_TIMEOUT_MS` | `300000` | Per-request timeout |
 | `AGY_MAX_CONCURRENCY` | `1` | Maximum concurrent `agy` subprocesses |
@@ -277,6 +321,7 @@ More patches can be added to `patchRequestBody()` in `provider-proxy.js`.
 | `agy-provider.js` | Optional standalone OpenAI-compatible local provider that wraps `agy --print` |
 | `package.json` | Optional dependencies, including `node-pty` for PTY/ConPTY-backed `agy` support |
 | `package-lock.json` | Locked dependency graph for reproducible `npm install` in submodule deployments |
+| `ecosystem.config.cjs` | PM2 process config for local Windows `/agy` hosting over Tailscale |
 | `opencode.json` | Example OpenCode provider config pointing at the local proxy |
 
 ## Usage
@@ -453,6 +498,7 @@ node provider-proxy.js
 | Container gets `curl: (28) Connection timed out` (Linux + UFW) | UFW is dropping the SYN from the compose network. Allow the subnet and insert the allow rule above the public deny. |
 | `/agy/v1/chat/completions` hangs or returns no output | Confirm `agy --print "Reply with OK"` works in the same terminal/account running the proxy |
 | `/agy` PTY mode is unavailable | Run `npm install` in this repo so `node-pty` is installed, or set `AGY_USE_PTY=0` to force plain pipes |
+| `execvp(3) failed.: Argument list too long` | Large prompts exceeded the OS argv limit. Keep or lower `AGY_ARG_PROMPT_MAX_BYTES` so prompts above that byte size are written to a temporary file and `agy --print` receives a short reference prompt. |
 
 ## Security
 

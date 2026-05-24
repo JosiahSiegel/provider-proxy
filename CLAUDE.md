@@ -117,6 +117,7 @@ The protocol module (`http` vs `https`) is selected per-request via `getRequestM
 | `provider-proxy.js` | Reverse proxy plus integrated `/agy` OpenAI-compatible local provider route |
 | `agy-provider.js` | Optional standalone `agy --print` OpenAI-compatible adapter |
 | `package.json` | Optional dependencies, including `node-pty` for PTY/ConPTY-backed `agy` support |
+| `ecosystem.config.cjs` | PM2 process config for local Windows `/agy` hosting over Tailscale |
 | `opencode.json` | Example OpenCode provider config pointing at the local proxy |
 
 ## Adding New Body Patches
