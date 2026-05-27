@@ -1,0 +1,14 @@
+node_modules
+bun.lock
+.claude
+.mcp.json
+.mcp*.json
+*.log
+.env
+.env.*
+!.env.example
+kaggle-ollama-provider-output/
+kaggle-kernel-init-check/
+kaggle-pulled-check/
+.kaggle-ollama-keeper-state.json
+run.sh

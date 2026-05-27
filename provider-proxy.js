@@ -19,6 +19,8 @@
 //                    from a Docker bridge (e.g. host.docker.internal on Linux)
 //                    or another non-loopback peer. The host firewall is then the
 //                    only thing preventing remote access — keep it locked down.
+//   OLLAMA_BASE_URL  Optional Ollama/OpenAI-compatible upstream URL for /ollama
+//   OLLAMA_NGROK_SKIP_BROWSER_WARNING  Set to 1 to add ngrok-skip-browser-warning:true for /ollama
 //   USER_AGENT       User-Agent header to inject (optional)
 //   EXTRA_HEADERS    JSON object of extra headers to inject (optional)
 //                    e.g. EXTRA_HEADERS='{"x-app":"cli","x-custom":"value"}'
@@ -28,7 +30,41 @@ const https = require("https");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { spawn } = require("child_process");
+
+// Load .env file into process.env if it exists
+const envPath = path.join(__dirname, ".env");
+if (fs.existsSync(envPath)) {
+  try {
+    const text = fs.readFileSync(envPath, "utf8");
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
+      const eqIdx = line.indexOf("=");
+      if (eqIdx === -1) continue;
+      const key = line.slice(0, eqIdx).trim();
+      let val = line.slice(eqIdx + 1).trim();
+      if (val.startsWith('"') && val.endsWith('"')) {
+        try {
+          val = JSON.parse(val);
+        } catch (_) {
+          val = val.slice(1, -1);
+        }
+      } else if (val.startsWith("'") && val.endsWith("'")) {
+        val = val.slice(1, -1);
+      } else {
+        const hashIdx = val.indexOf("#");
+        if (hashIdx !== -1) {
+          val = val.slice(0, hashIdx).trim();
+        }
+      }
+      process.env[key] = val;
+    }
+  } catch (err) {
+    console.error("[env] failed to load .env file:", err.message);
+  }
+}
+const { spawn, spawnSync } = require("child_process");
+const { createKaggleOllamaKeeper } = require("./kaggle-ollama-keeper");
 
 let pty = null;
 try {
@@ -43,15 +79,45 @@ const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB
 const DEBUG_PROXY = process.env.DEBUG_PROXY === "1";
 const DEBUG_BODY = process.env.DEBUG_BODY === "1";
 const AGY_PATH_PREFIX = process.env.AGY_PATH_PREFIX || "/agy";
+const OLLAMA_PATH_PREFIX = process.env.OLLAMA_PATH_PREFIX || "/ollama";
+const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL;
+const kaggleOllamaKeeper = createKaggleOllamaKeeper();
+const OLLAMA_PROVIDER_API_KEY = process.env.OLLAMA_PROVIDER_API_KEY;
+const OLLAMA_NGROK_SKIP_BROWSER_WARNING = process.env.OLLAMA_NGROK_SKIP_BROWSER_WARNING === "1";
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "ollama";
 const AGY_TIMEOUT_MS = parseInt(process.env.AGY_TIMEOUT_MS || "300000", 10);
 const AGY_MAX_CONCURRENCY = parseInt(process.env.AGY_MAX_CONCURRENCY || "1", 10);
 const AGY_PROVIDER_API_KEY = process.env.AGY_PROVIDER_API_KEY;
 const AGY_MODEL = process.env.AGY_MODEL || "agy/antigravity";
+const AGY_SECONDARY_MODEL = process.env.AGY_SECONDARY_MODEL || "agy/antigravity-opus";
+const AGY_SETTINGS_PATH = process.env.AGY_SETTINGS_PATH || path.join(os.homedir(), ".gemini", "antigravity-cli", "settings.json");
+const AGY_MODEL_SETTINGS = {
+  [AGY_MODEL]: process.env.AGY_MODEL_SETTING || "Gemini 3.5 Flash (Medium)",
+  [AGY_SECONDARY_MODEL]: process.env.AGY_SECONDARY_MODEL_SETTING || "Claude Opus 4.6 (Thinking)",
+};
 const AGY_DEBUG = process.env.AGY_DEBUG === "1";
 const AGY_USE_PTY = process.env.AGY_USE_PTY !== "0" && Boolean(pty);
 const AGY_ARG_PROMPT_MAX_BYTES = parseInt(process.env.AGY_ARG_PROMPT_MAX_BYTES || "16000", 10);
+
+function commandExists(command) {
+  return spawnSync(process.platform === "win32" ? "where" : "command", process.platform === "win32" ? [command] : ["-v", command], {
+    encoding: "utf8",
+    windowsHide: true,
+  }).status === 0;
+}
+
+function resolveCommand(command) {
+  if (!command || path.isAbsolute(command) || command.includes(path.sep) || (path.sep === "\\" && command.includes("/"))) return command;
+  const result = spawnSync(process.platform === "win32" ? "where" : "command", process.platform === "win32" ? [command] : ["-v", command], {
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  if (result.status !== 0) return command;
+  return result.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || command;
+}
+
 const AGY_CANDIDATE_BINS = [process.env.AGY_BIN, "agy"];
-const AGY_BIN = AGY_CANDIDATE_BINS.find((p) => p && (p === "agy" || fs.existsSync(p))) || "agy";
+const AGY_BIN = resolveCommand(AGY_CANDIDATE_BINS.find((p) => p && (fs.existsSync(p) || commandExists(p))) || "agy");
 
 let agyActiveRequests = 0;
 let agySetupProcess = null;
@@ -217,6 +283,16 @@ function patchRequestBody(bodyBuf, contentType) {
       modified = true;
     }
 
+    // Fix: If model is the generic "ollama", map it to the active Kaggle keeper model or default
+    if (obj.model === "ollama" || obj.model === "ollama:latest") {
+      const activeModel = kaggleOllamaKeeper.getStatus()?.model || OLLAMA_MODEL || "llama3.2";
+      if (activeModel && activeModel !== obj.model) {
+        console.log(`[patch] mapping model from "${obj.model}" to "${activeModel}"`);
+        obj.model = activeModel;
+        modified = true;
+      }
+    }
+
     if (modified) return Buffer.from(JSON.stringify(obj), "utf-8");
   } catch (_e) {
     // Not valid JSON or parse error — pass through unchanged
@@ -331,13 +407,26 @@ function sendJson(res, statusCode, body) {
   res.end(payload);
 }
 
-function sendOpenAiError(res, statusCode, message, type = "invalid_request_error") {
-  sendJson(res, statusCode, { error: { message, type, code: null } });
+function sendOpenAiError(res, statusCode, message, type = "invalid_request_error", headers = {}) {
+  const payload = JSON.stringify({ error: { message, type, code: null } });
+  res.writeHead(statusCode, {
+    "Content-Type": "application/json",
+    "Content-Length": Buffer.byteLength(payload),
+    ...headers,
+  });
+  res.end(payload);
 }
 
 function authenticateAgy(req, res) {
   if (!AGY_PROVIDER_API_KEY) return true;
   if (req.headers.authorization === `Bearer ${AGY_PROVIDER_API_KEY}`) return true;
+  sendOpenAiError(res, 401, "Unauthorized", "authentication_error");
+  return false;
+}
+
+function authenticateOllama(req, res) {
+  if (!OLLAMA_PROVIDER_API_KEY) return true;
+  if (req.headers.authorization === `Bearer ${OLLAMA_PROVIDER_API_KEY}`) return true;
   sendOpenAiError(res, 401, "Unauthorized", "authentication_error");
   return false;
 }
@@ -488,6 +577,29 @@ function stripAnsi(value) {
     .replace(/\r/g, "");
 }
 
+function selectAgyModel(model) {
+  const setting = AGY_MODEL_SETTINGS[model];
+  if (!setting) return;
+
+  let settings = {};
+  try {
+    if (fs.existsSync(AGY_SETTINGS_PATH)) settings = JSON.parse(fs.readFileSync(AGY_SETTINGS_PATH, "utf-8"));
+  } catch (err) {
+    throw new Error(`Failed to read agy settings at ${AGY_SETTINGS_PATH}: ${err.message}`);
+  }
+
+  if (settings.model === setting) return;
+  settings.model = setting;
+
+  try {
+    fs.mkdirSync(path.dirname(AGY_SETTINGS_PATH), { recursive: true });
+    fs.writeFileSync(AGY_SETTINGS_PATH, `${JSON.stringify(settings, null, 2)}\n`, "utf-8");
+  } catch (err) {
+    throw new Error(`Failed to write agy settings at ${AGY_SETTINGS_PATH}: ${err.message}`);
+  }
+  console.log(`[agy] selected Antigravity model ${setting}`);
+}
+
 function createAgyPromptInvocation(prompt) {
   if (Buffer.byteLength(prompt, "utf-8") <= AGY_ARG_PROMPT_MAX_BYTES) {
     return { promptArg: prompt, promptFile: null };
@@ -497,24 +609,33 @@ function createAgyPromptInvocation(prompt) {
   const promptFile = path.join(promptDir, "prompt.txt");
   fs.writeFileSync(promptFile, prompt, "utf-8");
   return {
-    promptArg: `Read the full prompt from this UTF-8 text file and respond to it exactly as instructed inside the file: ${promptFile}`,
+    promptArg: `Read the full prompt from this UTF-8 text file and respond to it exactly as instructed inside the file: ${JSON.stringify(promptFile)}`,
     promptFile,
   };
 }
 
+function createAgyArgs(invocation) {
+  const args = [];
+  if (invocation.promptFile) args.push("--add-dir", path.dirname(invocation.promptFile));
+  args.push("--print", invocation.promptArg, "--print-timeout", `${Math.ceil(AGY_TIMEOUT_MS / 1000)}s`);
+  return args;
+}
+
 function cleanupAgyPromptFile(promptFile) {
   if (!promptFile) return;
-  try {
-    fs.rmSync(path.dirname(promptFile), { recursive: true, force: true });
-  } catch (err) {
-    if (AGY_DEBUG) console.error("[agy] failed to remove prompt file", err.message);
-  }
+  setTimeout(() => {
+    try {
+      fs.rmSync(path.dirname(promptFile), { recursive: true, force: true });
+    } catch (err) {
+      if (AGY_DEBUG) console.error("[agy] failed to remove prompt file", err.message);
+    }
+  }, 30_000).unref?.();
 }
 
 function runAgyWithPty(prompt, callback) {
   if (!AGY_USE_PTY) return false;
   const invocation = createAgyPromptInvocation(prompt);
-  const args = ["--print", invocation.promptArg, "--print-timeout", `${Math.ceil(AGY_TIMEOUT_MS / 1000)}s`];
+  const args = createAgyArgs(invocation);
   console.log("[agy] chat using PTY", AGY_BIN, invocation.promptFile ? "file" : "argv");
   if (AGY_DEBUG) console.log("[agy] pty", AGY_BIN, args.map((arg) => (arg === invocation.promptArg ? "[PROMPT]" : arg)).join(" "));
 
@@ -564,10 +685,17 @@ function runAgyWithPty(prompt, callback) {
   return true;
 }
 
-function runAgy(prompt, callback) {
-  console.log(`[agy] chat request start; usePty=${AGY_USE_PTY}; bin=${AGY_BIN}; active=${agyActiveRequests}`);
+function runAgy(prompt, model, callback) {
+  console.log(`[agy] chat request start; model=${model || AGY_MODEL}; usePty=${AGY_USE_PTY}; bin=${AGY_BIN}; active=${agyActiveRequests}`);
   if (agyActiveRequests >= AGY_MAX_CONCURRENCY) {
     callback(new Error(`Too many active agy requests; AGY_MAX_CONCURRENCY=${AGY_MAX_CONCURRENCY}`));
+    return;
+  }
+
+  try {
+    selectAgyModel(model || AGY_MODEL);
+  } catch (err) {
+    callback(err);
     return;
   }
 
@@ -576,7 +704,7 @@ function runAgy(prompt, callback) {
   console.log(`[agy] chat using spawn fallback ${AGY_BIN}`);
 
   const invocation = createAgyPromptInvocation(prompt);
-  const args = ["--print", invocation.promptArg, "--print-timeout", `${Math.ceil(AGY_TIMEOUT_MS / 1000)}s`];
+  const args = createAgyArgs(invocation);
   if (AGY_DEBUG) console.log("[agy] spawn", AGY_BIN, args.map((arg) => (arg === invocation.promptArg ? "[PROMPT]" : arg)).join(" "));
 
   const child = spawn(AGY_BIN, args, { windowsHide: true, env: process.env });
@@ -765,17 +893,201 @@ function handleAgyChatCompletions(req, res) {
       sendOpenAiError(res, 400, "Request must include messages or prompt");
       return;
     }
-    runAgy(prompt, (err, text) => {
-      if (err) {
-        console.error("agy request failed:", err.message);
-        sendOpenAiError(res, 502, err.message, "provider_error");
+
+    const requestedModel = body.model || AGY_MODEL;
+    const finish = (model, text) => {
+      console.log(`POST ${AGY_PATH_PREFIX}/v1/chat/completions -> agy ${model} ${text.length} chars`);
+      const responseBody = { ...body, model };
+      if (body.stream) streamOpenAiCompletion(res, responseBody, text);
+      else sendJson(res, 200, openAiCompletionResponse(responseBody, text));
+    };
+
+    runAgy(prompt, requestedModel, (err, text) => {
+      if (!err) {
+        finish(requestedModel, text);
         return;
       }
-      console.log(`POST ${AGY_PATH_PREFIX}/v1/chat/completions -> agy ${text.length} chars`);
-      if (body.stream) streamOpenAiCompletion(res, body, text);
-      else sendJson(res, 200, openAiCompletionResponse(body, text));
+      if (requestedModel === AGY_MODEL && AGY_SECONDARY_MODEL && AGY_SECONDARY_MODEL !== AGY_MODEL) {
+        console.error(`agy request failed on ${requestedModel}; retrying ${AGY_SECONDARY_MODEL}:`, err.message);
+        runAgy(prompt, AGY_SECONDARY_MODEL, (fallbackErr, fallbackText) => {
+          if (fallbackErr) {
+            console.error("agy fallback request failed:", fallbackErr.message);
+            sendOpenAiError(res, 502, fallbackErr.message, "provider_error");
+            return;
+          }
+          finish(AGY_SECONDARY_MODEL, fallbackText);
+        });
+        return;
+      }
+      console.error("agy request failed:", err.message);
+      sendOpenAiError(res, 502, err.message, "provider_error");
     });
   });
+}
+
+function normalizeOllamaBaseUrl() {
+  const keeperUrl = kaggleOllamaKeeper.getBaseUrl();
+  const baseUrl = kaggleOllamaKeeper.enabled ? keeperUrl : keeperUrl || OLLAMA_BASE_URL;
+  if (!baseUrl) return null;
+  try {
+    const url = new URL(baseUrl);
+    url.pathname = url.pathname.replace(/\/$/, "");
+    return url;
+  } catch (_err) {
+    return null;
+  }
+}
+
+function shouldWakeOllamaKeeper(status, ollamaBase) {
+  return status.enabled && !ollamaBase && !status.waking && !status.checking && !status.stopping && status.status !== "stopping";
+}
+
+function shouldRetryOllamaLater(status) {
+  if (!status.enabled) return false;
+  if (status.stopping) return false;
+  if (status.waking || status.checking || status.wakeRequested) return true;
+  return [
+    "missing-or-inaccessible",
+    "KernelWorkerStatus.ERROR",
+    "KernelWorkerStatus.CANCEL_ACKNOWLEDGED",
+    "KernelWorkerStatus.CANCELED",
+    "KernelWorkerStatus.CANCELLED",
+  ].includes(status.status);
+}
+
+function ollamaUnavailableMessage(status) {
+  if (!status.enabled) return "Kaggle keeper not enabled; set KAGGLE_OLLAMA_AUTO=1 or set OLLAMA_BASE_URL";
+  if (status.stopping || status.status === "stopping") return "Ollama upstream is stopping. Try another provider and retry later.";
+  if (status.idle || status.status === "idle" || status.status === "idle_stopped") return "Ollama upstream is idle or stopped; Kaggle keeper wake requested. Retry shortly.";
+  if (status.waking || status.checking || status.wakeRequested) return "Ollama upstream is starting. Try another provider and retry shortly.";
+  return "Ollama upstream is unavailable; Kaggle keeper wake requested. Retry shortly.";
+}
+
+function ollamaUpstreamPath(pathname, search) {
+  const suffix = pathname.slice(OLLAMA_PATH_PREFIX.length) || "/";
+  return suffix.startsWith("/v1/") ? `${suffix}${search}` : `/v1${suffix}${search}`;
+}
+
+function handleOllamaRoute(req, res, parsedReqUrl) {
+  if (parsedReqUrl.pathname !== OLLAMA_PATH_PREFIX && !parsedReqUrl.pathname.startsWith(`${OLLAMA_PATH_PREFIX}/`)) return false;
+
+  const isStatusRequest = req.method === "GET" && (parsedReqUrl.pathname === OLLAMA_PATH_PREFIX || parsedReqUrl.pathname === `${OLLAMA_PATH_PREFIX}/`);
+  if (parsedReqUrl.pathname === `${OLLAMA_PATH_PREFIX}/callback`) {
+    readJsonBody(req, res, (body) => {
+      const result = kaggleOllamaKeeper.acceptCallback(req, body);
+      if (!result.ok) sendOpenAiError(res, result.status || 400, result.error || "Callback rejected");
+      else sendJson(res, 200, { status: "ok", upstream: result.url, model: result.model });
+    });
+    return true;
+  }
+
+  if (!authenticateOllama(req, res)) return true;
+
+  const ollamaBase = normalizeOllamaBaseUrl();
+  const status = kaggleOllamaKeeper.getStatus();
+
+  if (isStatusRequest) {
+    sendJson(res, 200, {
+      status: ollamaBase ? "ok" : status.status || "unavailable",
+      baseURL: `http://127.0.0.1:${PROXY_PORT}${OLLAMA_PATH_PREFIX}/v1`,
+      upstream: ollamaBase ? `${ollamaBase.origin}${ollamaBase.pathname}` : null,
+      model: status.model || OLLAMA_MODEL,
+      ngrokSkipBrowserWarning: OLLAMA_NGROK_SKIP_BROWSER_WARNING,
+      kaggle: status,
+    });
+    return true;
+  }
+
+  if (!ollamaBase) {
+    const shouldWake = shouldWakeOllamaKeeper(status, ollamaBase);
+    const shouldRetryLater = shouldWake || shouldRetryOllamaLater(status);
+    if (shouldWake) {
+      console.log("[ollama] no upstream available; requesting Kaggle keeper wake");
+      kaggleOllamaKeeper.wake().catch((err) => console.error("[ollama] Kaggle keeper wake failed:", err.message));
+    }
+    sendOpenAiError(
+      res,
+      503,
+      ollamaUnavailableMessage(status),
+      "provider_error",
+      shouldRetryLater ? { "Retry-After": "30" } : {}
+    );
+    return true;
+  }
+
+  const path = `${ollamaBase.pathname}${ollamaUpstreamPath(parsedReqUrl.pathname, parsedReqUrl.search)}`.replace(/\/+/g, "/");
+  const headers = {
+    ...req.headers,
+    host: ollamaBase.host,
+    ...INJECTED_HEADERS,
+  };
+  if (OLLAMA_NGROK_SKIP_BROWSER_WARNING) headers["ngrok-skip-browser-warning"] = "true";
+  delete headers["connection"];
+  delete headers["proxy-connection"];
+  delete headers["keep-alive"];
+  delete headers["transfer-encoding"];
+  delete headers["upgrade"];
+  delete headers["te"];
+  delete headers["trailer"];
+  delete headers["x-forwarded-for"];
+  delete headers["x-forwarded-host"];
+  delete headers["x-forwarded-proto"];
+  delete headers["x-forwarded-port"];
+  delete headers["x-real-ip"];
+  delete headers["x-original-host"];
+  delete headers["x-original-url"];
+  if (OLLAMA_PROVIDER_API_KEY) delete headers["authorization"];
+
+  const options = {
+    hostname: ollamaBase.hostname,
+    port: ollamaBase.port || (ollamaBase.protocol === "https:" ? 443 : 80),
+    path,
+    method: req.method,
+    headers,
+  };
+  const requestModule = ollamaBase.protocol === "https:" ? https : http;
+
+  if (shouldBufferBody(req.method) && req.headers["content-type"]?.includes("application/json")) {
+    const chunks = [];
+    let bodySize = 0;
+    let bodyExceeded = false;
+    req.on("data", (chunk) => {
+      bodySize += chunk.length;
+      if (bodySize > MAX_BODY_SIZE && !bodyExceeded) {
+        bodyExceeded = true;
+        sendOpenAiError(res, 413, "Payload too large");
+        return;
+      }
+      if (!bodyExceeded) chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (bodyExceeded) return;
+      let body = Buffer.concat(chunks);
+      body = patchRequestBody(body, req.headers["content-type"]);
+      delete options.headers["transfer-encoding"];
+      options.headers["content-length"] = body.length;
+      debugRequest(options, body, { protocol: ollamaBase.protocol.replace(":", ""), host: ollamaBase.host, port: options.port });
+      const proxyReq = requestModule.request(options, (proxyRes) => {
+        console.log(`${req.method} ${req.url} -> ${ollamaBase.host}${options.path} ${proxyRes.statusCode}`);
+        if (proxyRes.statusCode >= 200 && proxyRes.statusCode < 500) kaggleOllamaKeeper.recordActivity();
+        forwardResponse(proxyRes, res);
+      });
+      wireHandlers(proxyReq, req, res);
+      proxyReq.write(body);
+      proxyReq.end();
+    });
+    return true;
+  }
+
+  debugRequest(options, undefined, { protocol: ollamaBase.protocol.replace(":", ""), host: ollamaBase.host, port: options.port });
+  const proxyReq = requestModule.request(options, (proxyRes) => {
+    console.log(`${req.method} ${req.url} -> ${ollamaBase.host}${options.path} ${proxyRes.statusCode}`);
+    if (proxyRes.statusCode >= 200 && proxyRes.statusCode < 500) kaggleOllamaKeeper.recordActivity();
+    forwardResponse(proxyRes, res);
+  });
+  wireHandlers(proxyReq, req, res);
+  req.pipe(proxyReq, { end: true });
+  return true;
 }
 
 function handleAgyRoute(req, res, pathname) {
@@ -803,7 +1115,10 @@ function handleAgyRoute(req, res, pathname) {
   }
   if (req.method === "GET" && agyPaths.some((prefix) => pathname === `${prefix}/v1/models`)) {
     if (!authenticateAgy(req, res)) return true;
-    sendJson(res, 200, { object: "list", data: [{ id: AGY_MODEL, object: "model", created: 0, owned_by: "antigravity" }] });
+    sendJson(res, 200, {
+      object: "list",
+      data: [AGY_MODEL, AGY_SECONDARY_MODEL].map((id) => ({ id, object: "model", created: 0, owned_by: "antigravity" })),
+    });
     return true;
   }
   if (req.method === "POST" && agyPaths.some((prefix) => pathname === `${prefix}/v1/chat/completions`)) {
@@ -824,7 +1139,11 @@ const server = http.createServer((req, res) => {
   if (parsedReqUrl.pathname.includes(AGY_PATH_PREFIX)) {
     console.log(`[agy] incoming ${req.method} ${parsedReqUrl.pathname}`);
   }
+  if (parsedReqUrl.pathname === OLLAMA_PATH_PREFIX || parsedReqUrl.pathname.startsWith(`${OLLAMA_PATH_PREFIX}/`)) {
+    console.log(`[ollama] incoming ${req.method} ${parsedReqUrl.pathname}`);
+  }
   if (handleAgyRoute(req, res, parsedReqUrl.pathname)) return;
+  if (handleOllamaRoute(req, res, parsedReqUrl)) return;
 
   const route = resolveRoute(req.url);
   if (!route) {
@@ -938,6 +1257,16 @@ server.listen(PROXY_PORT, PROXY_BIND, () => {
   }
   console.log(`Built-in agy UI: http://${displayHost}:${PROXY_PORT}${AGY_PATH_PREFIX}/`);
   console.log(`Built-in agy OpenAI base URL: http://${displayHost}:${PROXY_PORT}${AGY_PATH_PREFIX}/v1`);
+  if (OLLAMA_BASE_URL || kaggleOllamaKeeper.enabled) {
+    console.log(`Built-in Ollama OpenAI base URL: http://${displayHost}:${PROXY_PORT}${OLLAMA_PATH_PREFIX}/v1`);
+    if (OLLAMA_BASE_URL) console.log(`Built-in Ollama upstream: ${OLLAMA_BASE_URL}`);
+    if (kaggleOllamaKeeper.enabled) {
+      console.log("Built-in Ollama Kaggle auto-keeper: enabled");
+      console.log(`Built-in Ollama Kaggle callback: http://${displayHost}:${PROXY_PORT}${OLLAMA_PATH_PREFIX}/callback`);
+    }
+    if (OLLAMA_NGROK_SKIP_BROWSER_WARNING) console.log("Built-in Ollama ngrok browser warning bypass header: enabled");
+  }
+  kaggleOllamaKeeper.start();
   console.log(`Built-in agy binary: ${AGY_BIN}`);
   console.log(`Built-in agy PTY: ${AGY_USE_PTY ? "enabled" : "disabled"}${pty ? "" : " (node-pty not available)"}`);
   if (TARGET_ROUTES.length === 0) {

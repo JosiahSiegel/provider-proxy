@@ -1,0 +1,11 @@
+{
+  "name": "Kaggle Ollama",
+  "baseURL": "http://host.docker.internal:9999/ollama/v1",
+  "apiKey": "choose-a-local-client-token",
+  "models": [
+    {
+      "id": "llama3.2",
+      "name": "Kaggle Ollama llama3.2"
+    }
+  ]
+}

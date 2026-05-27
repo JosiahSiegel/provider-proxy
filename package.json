@@ -1,6 +1,13 @@
 {
   "name": "provider-proxy",
   "private": true,
+  "scripts": {
+    "start": "node provider-proxy.js",
+    "tui": "node provider-proxy-tui.js",
+    "status": "node provider-proxy-tui.js --status",
+    "health": "node provider-proxy-tui.js --health",
+    "agy": "node agy-provider.js"
+  },
   "dependencies": {
     "node-pty": "^1.1.0"
   }

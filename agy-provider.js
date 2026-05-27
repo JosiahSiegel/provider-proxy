@@ -19,6 +19,12 @@ const TIMEOUT_MS = parseInt(process.env.AGY_TIMEOUT_MS || "300000", 10);
 const MAX_CONCURRENCY = parseInt(process.env.AGY_MAX_CONCURRENCY || "1", 10);
 const API_KEY = process.env.AGY_PROVIDER_API_KEY;
 const MODEL_NAME = process.env.AGY_MODEL || "agy/antigravity";
+const SECONDARY_MODEL_NAME = process.env.AGY_SECONDARY_MODEL || "agy/antigravity-opus";
+const SETTINGS_PATH = process.env.AGY_SETTINGS_PATH || path.join(os.homedir(), ".gemini", "antigravity-cli", "settings.json");
+const MODEL_SETTINGS = {
+  [MODEL_NAME]: process.env.AGY_MODEL_SETTING || "Gemini 3.5 Flash (Medium)",
+  [SECONDARY_MODEL_NAME]: process.env.AGY_SECONDARY_MODEL_SETTING || "Claude Opus 4.6 (Thinking)",
+};
 const DEBUG = process.env.AGY_DEBUG === "1";
 const USE_PTY = process.env.AGY_USE_PTY !== "0" && Boolean(pty);
 const ARG_PROMPT_MAX_BYTES = parseInt(process.env.AGY_ARG_PROMPT_MAX_BYTES || "16000", 10);
@@ -207,6 +213,29 @@ function stripAnsi(value) {
     .replace(/\r/g, "");
 }
 
+function selectModel(model) {
+  const setting = MODEL_SETTINGS[model];
+  if (!setting) return;
+
+  let settings = {};
+  try {
+    if (fs.existsSync(SETTINGS_PATH)) settings = JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf-8"));
+  } catch (err) {
+    throw new Error(`Failed to read agy settings at ${SETTINGS_PATH}: ${err.message}`);
+  }
+
+  if (settings.model === setting) return;
+  settings.model = setting;
+
+  try {
+    fs.mkdirSync(path.dirname(SETTINGS_PATH), { recursive: true });
+    fs.writeFileSync(SETTINGS_PATH, `${JSON.stringify(settings, null, 2)}\n`, "utf-8");
+  } catch (err) {
+    throw new Error(`Failed to write agy settings at ${SETTINGS_PATH}: ${err.message}`);
+  }
+  console.log(`[agy] selected Antigravity model ${setting}`);
+}
+
 function createPromptInvocation(prompt) {
   if (Buffer.byteLength(prompt, "utf-8") <= ARG_PROMPT_MAX_BYTES) {
     return { promptArg: prompt, promptFile: null };
@@ -293,9 +322,16 @@ function runAgyWithPty(prompt, callback) {
   return true;
 }
 
-function runAgy(prompt, callback) {
+function runAgy(prompt, model, callback) {
   if (activeRequests >= MAX_CONCURRENCY) {
     callback(new Error(`Too many active agy requests; AGY_MAX_CONCURRENCY=${MAX_CONCURRENCY}`));
+    return;
+  }
+
+  try {
+    selectModel(model || MODEL_NAME);
+  } catch (err) {
+    callback(err);
     return;
   }
 
@@ -514,19 +550,36 @@ function handleChatCompletions(req, res) {
       return;
     }
 
-    runAgy(prompt, (err, text) => {
-      if (err) {
-        console.error("agy request failed:", err.message);
-        sendError(res, 502, err.message, "provider_error");
+    const requestedModel = body.model || MODEL_NAME;
+    const finish = (model, text) => {
+      console.log(`POST /v1/chat/completions -> agy ${model} ${text.length} chars`);
+      const responseBody = { ...body, model };
+      if (body.stream) {
+        streamCompletion(res, responseBody, text);
+      } else {
+        sendJson(res, 200, completionResponse(responseBody, text));
+      }
+    };
+
+    runAgy(prompt, requestedModel, (err, text) => {
+      if (!err) {
+        finish(requestedModel, text);
         return;
       }
-
-      console.log(`POST /v1/chat/completions -> agy ${text.length} chars`);
-      if (body.stream) {
-        streamCompletion(res, body, text);
-      } else {
-        sendJson(res, 200, completionResponse(body, text));
+      if (requestedModel === MODEL_NAME && SECONDARY_MODEL_NAME && SECONDARY_MODEL_NAME !== MODEL_NAME) {
+        console.error(`agy request failed on ${requestedModel}; retrying ${SECONDARY_MODEL_NAME}:`, err.message);
+        runAgy(prompt, SECONDARY_MODEL_NAME, (fallbackErr, fallbackText) => {
+          if (fallbackErr) {
+            console.error("agy fallback request failed:", fallbackErr.message);
+            sendError(res, 502, fallbackErr.message, "provider_error");
+            return;
+          }
+          finish(SECONDARY_MODEL_NAME, fallbackText);
+        });
+        return;
       }
+      console.error("agy request failed:", err.message);
+      sendError(res, 502, err.message, "provider_error");
     });
   });
 }
@@ -563,7 +616,7 @@ const server = http.createServer((req, res) => {
     if (!authenticate(req, res)) return;
     sendJson(res, 200, {
       object: "list",
-      data: [{ id: MODEL_NAME, object: "model", created: 0, owned_by: "antigravity" }],
+      data: [MODEL_NAME, SECONDARY_MODEL_NAME].map((id) => ({ id, object: "model", created: 0, owned_by: "antigravity" })),
     });
     return;
   }
