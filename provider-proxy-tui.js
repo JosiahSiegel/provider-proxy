@@ -15,6 +15,22 @@ const PID_PATH = path.join(ROOT, ".provider-proxy.pid");
 const LOG_PATH = path.join(ROOT, ".provider-proxy.log");
 const PROXY_SCRIPT = path.join(ROOT, "provider-proxy.js");
 
+// Sync PM2_HOME with the system-wide service registry setting if on Windows
+if (process.platform === "win32") {
+  try {
+    const regResult = spawnSync("reg.exe", ["query", "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", "/v", "PM2_HOME"], { encoding: "utf8", windowsHide: true, timeout: 1000 });
+    if (regResult.status === 0) {
+      const match = regResult.stdout.match(/PM2_HOME\s+REG_SZ\s+(.*)/);
+      if (match) {
+        const sysPm2Home = match[1].trim();
+        if (sysPm2Home) {
+          process.env.PM2_HOME = sysPm2Home;
+        }
+      }
+    }
+  } catch (_err) {}
+}
+
 const COLOR = process.env.NO_COLOR || process.env.TERM === "dumb" ? false : process.stdout.isTTY;
 const ansi = {
   reset: "\x1b[0m",
@@ -374,6 +390,17 @@ function mergedEnv() {
   return env;
 }
 
+function pm2CommandEnv() {
+  const keep = ["PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE"];
+  const env = {};
+  for (const key of keep) {
+    if (process.env[key]) env[key] = process.env[key];
+  }
+  if (process.env.PM2_HOME) env.PM2_HOME = process.env.PM2_HOME;
+  if (process.env.PM2_SERVICE_PM2_DIR) env.PM2_SERVICE_PM2_DIR = process.env.PM2_SERVICE_PM2_DIR;
+  return { ...env, ...app.env };
+}
+
 function port() {
   const n = Number(app.env.PROXY_PORT || 9999);
   return Number.isInteger(n) && n > 0 && n < 65536 ? n : 9999;
@@ -462,7 +489,13 @@ function pm2Status() {
   if (result.error) return { available: true, running: false, error: result.error.message };
   if (result.status !== 0) return { available: true, running: false, error: (result.stderr || result.stdout || "pm2 status failed").trim() };
   try {
-    const apps = JSON.parse(result.stdout || "[]");
+    let cleanStdout = (result.stdout || "").trim();
+    const firstBrack = cleanStdout.indexOf("[");
+    const lastBrack = cleanStdout.lastIndexOf("]");
+    if (firstBrack !== -1 && lastBrack !== -1 && lastBrack > firstBrack) {
+      cleanStdout = cleanStdout.slice(firstBrack, lastBrack + 1);
+    }
+    const apps = JSON.parse(cleanStdout || "[]");
     if (!Array.isArray(apps)) return { available: true, running: false, error: "pm2 jlist returned non-array JSON" };
     const proc = apps.find((p) => p && p.name === "provider-proxy");
     return { available: true, running: proc?.pm2_env?.status === "online", status: proc?.pm2_env?.status || "missing", pid: proc?.pid };
@@ -658,7 +691,7 @@ function pm2(args) {
 
 function runPm2(args) {
   try {
-    return spawnSyncCommand("pm2", args, { cwd: ROOT, env: mergedEnv(), encoding: "utf8", windowsHide: true, timeout: 30000, maxBuffer: 1024 * 1024 * 4 });
+    return spawnSyncCommand("pm2", args, { cwd: ROOT, env: pm2CommandEnv(), encoding: "utf8", windowsHide: true, timeout: 30000, maxBuffer: 1024 * 1024 * 4 });
   } catch (err) {
     setMessage(`pm2 ${args.join(" ")} failed: ${err.message}`);
     return null;
@@ -1607,6 +1640,203 @@ function openKaggleKernelPage() {
   openUrl(slug ? `https://www.kaggle.com/code/${slug}` : "https://www.kaggle.com/code");
 }
 
+function setupPm2Service() {
+  suspendInput();
+  if (process.stdout.isTTY && COLOR) process.stdout.write(ansi.clear + ansi.showCursor);
+  else console.log("");
+
+  console.log(c("bold", c("cyan", "PM2 Startup Service Configurator & Repair Tool")));
+  console.log(c("dim", "─".repeat(width() - 2)));
+  console.log("This tool will stop and delete any broken/conflicting PM2 services, configure");
+  console.log("system-wide PM2 environment variables, and reinstall the PM2 service wrapper.");
+  console.log("");
+  console.log(c("yellow", "Please click 'Yes' on the User Account Control (UAC) prompt when it appears..."));
+  console.log("");
+
+  const psScript = `
+$Host.UI.RawUI.WindowTitle = 'PM2 Startup Service Setup'
+Clear-Host
+Write-Host '=== PM2 Startup Service Setup ===' -ForegroundColor Cyan
+Write-Host ''
+
+Write-Host '[1/5] Stopping and deleting old pm2.exe/PM2 services...' -ForegroundColor Yellow
+try { sc.exe stop pm2.exe 2>$null; sc.exe delete pm2.exe 2>$null } catch {}
+try { sc.exe stop PM2 2>$null; sc.exe delete PM2 2>$null } catch {}
+
+# Find pm2-service-uninstall.cmd dynamically or use fallback
+$uninstallCmd = Get-Command pm2-service-uninstall.cmd -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+if (-not $uninstallCmd) {
+  if (Test-Path 'C:\\ProgramData\\npm\\npm\\pm2-service-uninstall.cmd') {
+    $uninstallCmd = 'C:\\ProgramData\\npm\\npm\\pm2-service-uninstall.cmd'
+  }
+}
+
+if ($uninstallCmd) {
+  Write-Host "[2/5] Running pm2-service-uninstall from: $uninstallCmd" -ForegroundColor Yellow
+  try { & $uninstallCmd --unattended } catch {}
+} else {
+  Write-Host '[2/5] pm2-service-uninstall.cmd not found, skipping...' -ForegroundColor Yellow
+}
+
+Write-Host '[3/5] Creating PM2 directories in C:\\ProgramData\\pm2...' -ForegroundColor Yellow
+try {
+  New-Item -ItemType Directory -Force 'C:\\ProgramData\\pm2\\home' | Out-Null
+  New-Item -ItemType Directory -Force 'C:\\ProgramData\\pm2\\service' | Out-Null
+} catch {
+  Write-Host 'Failed to create directories!' -ForegroundColor Red
+}
+
+# Resolve PM2 and pm2-windows-service paths dynamically before changing services
+$npmPrefix = (npm config get prefix 2>$null | Select-Object -First 1)
+if ($npmPrefix) { $npmPrefix = $npmPrefix.Trim() }
+if (-not $npmPrefix) { $npmPrefix = 'C:\\ProgramData\\npm\\npm' }
+$pm2Entry = Join-Path $npmPrefix 'node_modules\\pm2\\index.js'
+$serviceModule = Join-Path $npmPrefix 'node_modules\\pm2-windows-service'
+
+if (-not (Test-Path $pm2Entry)) {
+  Write-Host "PM2 entrypoint not found: $pm2Entry" -ForegroundColor Red
+  throw 'Cannot install PM2 service without global pm2 package.'
+}
+if (-not (Test-Path $serviceModule)) {
+  Write-Host "pm2-windows-service package not found: $serviceModule" -ForegroundColor Red
+  throw 'Install pm2-windows-service globally before configuring the startup service.'
+}
+
+Write-Host "[4/5] Setting system environment variables (PM2_SERVICE_PM2_DIR=$pm2Entry)..." -ForegroundColor Yellow
+[Environment]::SetEnvironmentVariable('PM2_HOME', 'C:\\ProgramData\\pm2\\home', 'Machine')
+[Environment]::SetEnvironmentVariable('PM2_SERVICE_PM2_DIR', $pm2Entry, 'Machine')
+$env:PM2_HOME = 'C:\\ProgramData\\pm2\\home'
+$env:PM2_SERVICE_PM2_DIR = $pm2Entry
+Write-Host 'System PM2_HOME set to C:\\ProgramData\\pm2\\home' -ForegroundColor Green
+Write-Host "System PM2_SERVICE_PM2_DIR set to $pm2Entry" -ForegroundColor Green
+
+Write-Host '[5/5] Installing new PM2 Windows service without interactive prompts...' -ForegroundColor Yellow
+$env:PM2_WINDOWS_SERVICE_MODULE = $serviceModule
+$nodeScript = @'
+const pm2ws = require(process.env.PM2_WINDOWS_SERVICE_MODULE);
+(async () => {
+  try { await pm2ws.uninstall(); } catch (_) {}
+  await pm2ws.install(undefined, true);
+})().catch((err) => {
+  console.error(err && err.stack ? err.stack : err);
+  process.exit(1);
+});
+'@
+$nodeScript | node
+if ($LASTEXITCODE -ne 0) { throw "pm2-windows-service install failed with exit code $LASTEXITCODE" }
+
+Write-Host ''
+Write-Host 'Verifying installed service and machine environment...' -ForegroundColor Yellow
+sc.exe query pm2.exe
+sc.exe qc pm2.exe
+Write-Host "Machine PM2_HOME=$([Environment]::GetEnvironmentVariable('PM2_HOME', 'Machine'))"
+Write-Host "Machine PM2_SERVICE_PM2_DIR=$([Environment]::GetEnvironmentVariable('PM2_SERVICE_PM2_DIR', 'Machine'))"
+Write-Host ''
+Write-Host 'Setup finished! Press any key to return to provider-proxy TUI...' -ForegroundColor Green
+[void]$Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+`;
+
+  const tmpdir = os.tmpdir();
+  const tempScriptPath = path.join(tmpdir, `pm2-service-setup-${Date.now()}.ps1`);
+  fs.writeFileSync(tempScriptPath, psScript, "utf8");
+
+  const child = spawn("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    `Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File \\"${tempScriptPath}\\"" -Verb RunAs -Wait`
+  ], { stdio: "inherit", windowsHide: true });
+
+  child.on("error", (err) => {
+    try { fs.unlinkSync(tempScriptPath); } catch {}
+    console.log(`\nFailed to start elevated installer: ${err.message}. Press Enter to return.`);
+    waitForReturn();
+  });
+
+  child.on("close", (code, signal) => {
+    try { fs.unlinkSync(tempScriptPath); } catch {}
+    process.env.PM2_HOME = "C:\\ProgramData\\pm2\\home";
+    console.log(`\nPM2 Service configuration complete. TUI PM2_HOME is now synchronized.`);
+    console.log("Press Enter to return to TUI.");
+    waitForReturn();
+  });
+}
+
+function uninstallPm2Service() {
+  suspendInput();
+  if (process.stdout.isTTY && COLOR) process.stdout.write(ansi.clear + ansi.showCursor);
+  else console.log("");
+
+  console.log(c("bold", c("cyan", "PM2 Startup Service Uninstaller")));
+  console.log(c("dim", "─".repeat(width() - 2)));
+  console.log("This tool will stop and uninstall the PM2 Windows service wrapper.");
+  console.log("");
+  console.log(c("yellow", "Please click 'Yes' on the User Account Control (UAC) prompt when it appears..."));
+  console.log("");
+
+  const psScript = `
+$Host.UI.RawUI.WindowTitle = 'PM2 Startup Service Uninstallation'
+Clear-Host
+Write-Host '=== PM2 Startup Service Uninstallation ===' -ForegroundColor Cyan
+Write-Host ''
+
+Write-Host '[1/3] Stopping and deleting PM2 Windows service...' -ForegroundColor Yellow
+try { sc.exe stop PM2 2>$null; sc.exe delete PM2 2>$null } catch {}
+try { sc.exe stop pm2.exe 2>$null; sc.exe delete pm2.exe 2>$null } catch {}
+
+# Find pm2-service-uninstall.cmd dynamically or use fallback
+$uninstallCmd = Get-Command pm2-service-uninstall.cmd -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+if (-not $uninstallCmd) {
+  if (Test-Path 'C:\\ProgramData\\npm\\npm\\pm2-service-uninstall.cmd') {
+    $uninstallCmd = 'C:\\ProgramData\\npm\\npm\\pm2-service-uninstall.cmd'
+  }
+}
+
+if ($uninstallCmd) {
+  Write-Host "[2/3] Running pm2-service-uninstall from: $uninstallCmd" -ForegroundColor Yellow
+  try { & $uninstallCmd --unattended } catch {}
+} else {
+  Write-Host '[2/3] pm2-service-uninstall.cmd not found, skipping...' -ForegroundColor Yellow
+}
+
+Write-Host '[3/3] Removing PM2 system environment variables...' -ForegroundColor Yellow
+try {
+  [Environment]::SetEnvironmentVariable('PM2_HOME', $null, 'Machine')
+  [Environment]::SetEnvironmentVariable('PM2_SERVICE_PM2_DIR', $null, 'Machine')
+  Write-Host 'System PM2 environment variables cleared.' -ForegroundColor Green
+} catch {
+  Write-Host 'Failed to clear system environment variables!' -ForegroundColor Red
+}
+
+Write-Host ''
+Write-Host 'Uninstallation finished! Press any key to return to provider-proxy TUI...' -ForegroundColor Green
+[void]$Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+`;
+
+  const tmpdir = os.tmpdir();
+  const tempScriptPath = path.join(tmpdir, `pm2-service-uninstall-${Date.now()}.ps1`);
+  fs.writeFileSync(tempScriptPath, psScript, "utf8");
+
+  const child = spawn("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    `Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File \\"${tempScriptPath}\\"" -Verb RunAs -Wait`
+  ], { stdio: "inherit", windowsHide: true });
+
+  child.on("error", (err) => {
+    try { fs.unlinkSync(tempScriptPath); } catch {}
+    console.log(`\nFailed to start elevated uninstaller: ${err.message}. Press Enter to return.`);
+    waitForReturn();
+  });
+
+  child.on("close", (code, signal) => {
+    try { fs.unlinkSync(tempScriptPath); } catch {}
+    console.log(`\nPM2 Service successfully uninstalled. Press Enter to return.`);
+    waitForReturn();
+  });
+}
+
 function setupItems() {
   return [
     { label: "Create .env from template", detail: fs.existsSync(ENV_PATH) ? ".env already exists" : "copy .env.example", action: () => setMessage(ensureEnv() ? "Created .env from template." : ".env already exists.") },
@@ -1620,6 +1850,8 @@ function setupItems() {
     { label: "Open Kaggle kernel page", detail: app.env.KAGGLE_KERNEL_SLUG || "https://www.kaggle.com/code", action: openKaggleKernelPage },
     { label: "Open agy setup UI", detail: `${app.env.AGY_PATH_PREFIX || "/agy"}/`, action: () => openUrl(`http://127.0.0.1:${port()}${app.env.AGY_PATH_PREFIX || "/agy"}/`) },
     { label: "PM2 save", detail: "persist current PM2 process list", action: savePm2 },
+    { label: "Configure PM2 Startup Service", detail: "install/repair PM2 Windows service for autostart", action: setupPm2Service },
+    { label: "Uninstall PM2 Startup Service", detail: "remove PM2 Windows startup service", action: () => confirm("Uninstall PM2 Startup Service?", uninstallPm2Service) },
     { label: "Clear direct pid state", detail: "does not kill unknown processes", action: clearRuntimeState },
   ];
 }

@@ -394,6 +394,7 @@ function sendHtml(res, statusCode, body) {
   res.writeHead(statusCode, {
     "Content-Type": "text/html; charset=utf-8",
     "Content-Length": Buffer.byteLength(body),
+    "Cache-Control": "no-store",
   });
   res.end(body);
 }
@@ -570,11 +571,52 @@ function stopAgyInteractiveSetup() {
   return true;
 }
 
+function writeAgyInteractiveInput(data) {
+  if (!agySetupProcess || agySetupStatus !== "running") return { ok: false, error: "agy setup process is not running" };
+  if (typeof data !== "string") return { ok: false, error: "input must be a string" };
+  if (Buffer.byteLength(data, "utf-8") > 4096) return { ok: false, error: "input too large" };
+  if (AGY_USE_PTY && typeof agySetupProcess.write === "function") {
+    agySetupProcess.write(data);
+    return { ok: true };
+  }
+  if (agySetupProcess.stdin?.writable) {
+    agySetupProcess.stdin.write(data);
+    return { ok: true };
+  }
+  return { ok: false, error: "agy setup process is not writable" };
+}
+
 function stripAnsi(value) {
   return value
     .replace(/\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/\][^]*(|\\)/g, "")
     .replace(/\r/g, "");
+}
+
+function browserTerminalText(value) {
+  return stripAnsi(value).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+
+function extractTerminalUrls(value) {
+  const lines = browserTerminalText(value).split("\n");
+  const urls = [];
+  const urlChars = /^[A-Za-z0-9\-._~:/?#[\]@!$&()*+,;=%]+$/;
+  for (let i = 0; i < lines.length; i += 1) {
+    const start = lines[i].search(/https?:\/\//);
+    if (start === -1) continue;
+    let candidate = lines[i].slice(start).trim();
+    for (let j = i + 1; j < lines.length; j += 1) {
+      const part = lines[j].trim();
+      if (!part || !urlChars.test(part)) break;
+      candidate += part;
+      i = j;
+    }
+    candidate = candidate.replace(/[>)}\].,;:'"]+$/g, "");
+    try {
+      urls.push(new URL(candidate).href);
+    } catch (_err) {}
+  }
+  return [...new Set(urls)].slice(-5);
 }
 
 function selectAgyModel(model) {
@@ -790,6 +832,11 @@ function renderAgyUi() {
     button { margin-right: 8px; padding: 8px 12px; }
     input { width: 100%; padding: 8px; box-sizing: border-box; }
     .row { margin: 16px 0; }
+    #terminal { background: #111; color: #eee; min-height: 320px; max-height: 520px; overflow: auto; outline: 2px solid transparent; user-select: text; }
+    #terminal:focus { outline-color: #6aa9ff; }
+    #links:empty { display: none; }
+    #links a { display: block; margin: 4px 0; overflow-wrap: anywhere; }
+    .hint { color: #666; }
   </style>
 </head>
 <body>
@@ -804,7 +851,10 @@ function renderAgyUi() {
     <button onclick="runTest()">Run OK test</button>
   </div>
   <div class="row"><label>Test prompt</label><input id="prompt" value="Reply with exactly OK"></div>
-  <h2>Setup output</h2><pre id="output"></pre>
+  <h2>Interactive setup terminal</h2>
+  <p class="hint">Click the terminal, then type normally. Select text to copy; output only auto-scrolls if you are already at the bottom. Ctrl+C is forwarded to agy when no text is selected.</p>
+  <pre id="terminal" tabindex="0" aria-label="Interactive agy setup terminal"></pre>
+  <div id="links" class="row"></div>
   <h2>Test result</h2><pre id="test"></pre>
 <script>
 const prefixes = Array.from(new Set([
@@ -813,6 +863,32 @@ const prefixes = Array.from(new Set([
   ${JSON.stringify(AGY_PATH_PREFIX)}
 ]));
 let activePrefix = null;
+let lastTerminalText = '';
+function terminalText(output) {
+  return (output || []).map(e => e && e.text ? e.text : '').join('');
+}
+function renderLinks(urls) {
+  const links = document.getElementById('links');
+  urls = Array.isArray(urls) ? urls : [];
+  links.textContent = '';
+  for (const url of urls) {
+    const row = document.createElement('div');
+    const a = document.createElement('a');
+    a.href = url;
+    a.target = '_blank';
+    a.rel = 'noreferrer';
+    a.textContent = url;
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.textContent = 'Copy URL';
+    copy.onclick = async () => {
+      await navigator.clipboard.writeText(url);
+      document.getElementById('test').textContent = 'Copied URL: ' + url;
+    };
+    row.append(a, copy);
+    links.append(row);
+  }
+}
 async function requestJson(prefix, path, options) {
   const response = await fetch(prefix + path, options);
   const text = await response.text();
@@ -849,10 +925,74 @@ async function json(path, options) {
   activePrefix = null;
   return last ? last.data : { error: 'request failed' };
 }
+async function sendTerminalInput(input) {
+  const result = await json('/setup/input', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ input })
+  });
+  if (result && result.error) document.getElementById('test').textContent = JSON.stringify(result, null, 2);
+}
+function setupTerminalKeyboard() {
+  const terminal = document.getElementById('terminal');
+  terminal.addEventListener('keydown', (event) => {
+    if (event.ctrlKey && event.key.toLowerCase() === 'c') {
+      if (String(window.getSelection())) return;
+      event.preventDefault();
+      sendTerminalInput('\\u0003');
+      return;
+    }
+    if (event.altKey || event.metaKey || event.ctrlKey) return;
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      sendTerminalInput('\\r');
+      return;
+    }
+    if (event.key === 'Backspace') {
+      event.preventDefault();
+      sendTerminalInput('\\u007f');
+      return;
+    }
+    if (event.key === 'Tab') {
+      event.preventDefault();
+      sendTerminalInput('\\t');
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      sendTerminalInput('\\u001b');
+      return;
+    }
+    if (event.key === 'ArrowUp') return void sendTerminalInput('\\u001b[A');
+    if (event.key === 'ArrowDown') return void sendTerminalInput('\\u001b[B');
+    if (event.key === 'ArrowRight') return void sendTerminalInput('\\u001b[C');
+    if (event.key === 'ArrowLeft') return void sendTerminalInput('\\u001b[D');
+    if (event.key.length === 1) {
+      event.preventDefault();
+      sendTerminalInput(event.key);
+    }
+  });
+  terminal.addEventListener('paste', (event) => {
+    const text = event.clipboardData && event.clipboardData.getData('text');
+    if (!text) return;
+    event.preventDefault();
+    sendTerminalInput(text);
+  });
+}
 async function refresh() {
   const data = await discoverPrefix();
   document.getElementById('status').textContent = data.status || 'unreachable';
-  document.getElementById('output').textContent = (data.output || []).map(e => '[' + e.time + '] ' + e.source + ': ' + e.text).join('');
+  const terminal = document.getElementById('terminal');
+  const output = Array.isArray(data.output) ? data.output : [];
+  const lineBreak = String.fromCharCode(10);
+  const nextText = terminalText(output) || (data.status === 'running' ? 'agy setup is running; waiting for terminal output...' + lineBreak : 'Click "Start interactive agy login/setup" to start a terminal.' + lineBreak);
+  if (nextText !== lastTerminalText) {
+    const wasNearBottom = terminal.scrollHeight - terminal.scrollTop - terminal.clientHeight < 24;
+    terminal.textContent = nextText;
+    renderLinks(data.urls);
+    if (wasNearBottom || !lastTerminalText) terminal.scrollTop = terminal.scrollHeight;
+    lastTerminalText = nextText;
+  }
 }
 async function startSetup() {
   document.getElementById('status').textContent = 'starting...';
@@ -878,7 +1018,8 @@ async function runTest() {
     document.getElementById('test').textContent = String(err && err.stack ? err.stack : err);
   }
 }
-setInterval(refresh, 1500);
+setupTerminalKeyboard();
+setInterval(refresh, 500);
 refresh();
 </script>
 </body>
@@ -1105,8 +1246,17 @@ function handleAgyRoute(req, res, pathname) {
     sendJson(res, 200, { stopped: stopAgyInteractiveSetup(), status: agySetupStatus });
     return true;
   }
+  if (req.method === "POST" && agyPaths.some((prefix) => pathname === `${prefix}/setup/input`)) {
+    readJsonBody(req, res, (body) => {
+      const result = writeAgyInteractiveInput(body.input);
+      sendJson(res, result.ok ? 200 : 400, result);
+    });
+    return true;
+  }
   if (req.method === "GET" && agyPaths.some((prefix) => pathname === `${prefix}/setup/status`)) {
-    sendJson(res, 200, { status: agySetupStatus, running: Boolean(agySetupProcess), output: agySetupOutput });
+    const output = agySetupOutput.map((entry) => ({ ...entry, text: browserTerminalText(entry.text) }));
+    const urls = extractTerminalUrls(agySetupOutput.map((entry) => entry.text).join(""));
+    sendJson(res, 200, { status: agySetupStatus, running: Boolean(agySetupProcess), output, urls });
     return true;
   }
   if (req.method === "GET" && agyPaths.some((prefix) => pathname === `${prefix}/health`)) {
