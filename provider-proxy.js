@@ -98,6 +98,7 @@ const AGY_MODEL_SETTINGS = {
 const AGY_DEBUG = process.env.AGY_DEBUG === "1";
 const AGY_USE_PTY = process.env.AGY_USE_PTY !== "0" && Boolean(pty);
 const AGY_ARG_PROMPT_MAX_BYTES = parseInt(process.env.AGY_ARG_PROMPT_MAX_BYTES || "16000", 10);
+const AGY_DEFAULT_WORKSPACE = process.env.AGY_DEFAULT_WORKSPACE || "";
 
 function commandExists(command) {
   return spawnSync(process.platform === "win32" ? "where" : "command", process.platform === "win32" ? [command] : ["-v", command], {
@@ -476,11 +477,12 @@ function textFromContent(content) {
   return content.map(textFromContentPart).filter(Boolean).join("\n");
 }
 
-function buildAgyPrompt(body) {
+function buildAgyPrompt(body, workspaceDir) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
-  if (messages.length === 0 && typeof body.prompt === "string") return body.prompt;
+  if (messages.length === 0 && typeof body.prompt === "string" && !workspaceDir) return body.prompt;
 
   const sections = [];
+  if (workspaceDir) sections.push(`CURRENT WORKSPACE:\n${workspaceDir}`);
   const system = Array.isArray(body.system) ? body.system.map(textFromContent).filter(Boolean).join("\n\n") : textFromContent(body.system);
   if (system) sections.push(`SYSTEM:\n${system}`);
 
@@ -642,9 +644,9 @@ function selectAgyModel(model) {
   console.log(`[agy] selected Antigravity model ${setting}`);
 }
 
-function createAgyPromptInvocation(prompt) {
+function createAgyPromptInvocation(prompt, workspaceDir) {
   if (Buffer.byteLength(prompt, "utf-8") <= AGY_ARG_PROMPT_MAX_BYTES) {
-    return { promptArg: prompt, promptFile: null };
+    return { promptArg: prompt, promptFile: null, workspaceDir };
   }
 
   const promptDir = fs.mkdtempSync(path.join(os.tmpdir(), "provider-proxy-agy-"));
@@ -653,11 +655,13 @@ function createAgyPromptInvocation(prompt) {
   return {
     promptArg: `Read the full prompt from this UTF-8 text file and respond to it exactly as instructed inside the file: ${JSON.stringify(promptFile)}`,
     promptFile,
+    workspaceDir,
   };
 }
 
 function createAgyArgs(invocation) {
   const args = [];
+  if (invocation.workspaceDir) args.push("--add-dir", invocation.workspaceDir);
   if (invocation.promptFile) args.push("--add-dir", path.dirname(invocation.promptFile));
   args.push("--print", invocation.promptArg, "--print-timeout", `${Math.ceil(AGY_TIMEOUT_MS / 1000)}s`);
   return args;
@@ -674,9 +678,9 @@ function cleanupAgyPromptFile(promptFile) {
   }, 30_000).unref?.();
 }
 
-function runAgyWithPty(prompt, callback) {
+function runAgyWithPty(prompt, workspaceDir, callback) {
   if (!AGY_USE_PTY) return false;
-  const invocation = createAgyPromptInvocation(prompt);
+  const invocation = createAgyPromptInvocation(prompt, workspaceDir);
   const args = createAgyArgs(invocation);
   console.log("[agy] chat using PTY", AGY_BIN, invocation.promptFile ? "file" : "argv");
   if (AGY_DEBUG) console.log("[agy] pty", AGY_BIN, args.map((arg) => (arg === invocation.promptArg ? "[PROMPT]" : arg)).join(" "));
@@ -687,7 +691,7 @@ function runAgyWithPty(prompt, callback) {
       name: "xterm-256color",
       cols: 160,
       rows: 40,
-      cwd: process.cwd(),
+      cwd: invocation.workspaceDir || process.cwd(),
       env: process.env,
     });
   } catch (err) {
@@ -727,8 +731,8 @@ function runAgyWithPty(prompt, callback) {
   return true;
 }
 
-function runAgy(prompt, model, callback) {
-  console.log(`[agy] chat request start; model=${model || AGY_MODEL}; usePty=${AGY_USE_PTY}; bin=${AGY_BIN}; active=${agyActiveRequests}`);
+function runAgy(prompt, model, workspaceDir, callback) {
+  console.log(`[agy] chat request start; model=${model || AGY_MODEL}; usePty=${AGY_USE_PTY}; bin=${AGY_BIN}; workspace=${workspaceDir || "default"}; active=${agyActiveRequests}`);
   if (agyActiveRequests >= AGY_MAX_CONCURRENCY) {
     callback(new Error(`Too many active agy requests; AGY_MAX_CONCURRENCY=${AGY_MAX_CONCURRENCY}`));
     return;
@@ -742,14 +746,14 @@ function runAgy(prompt, model, callback) {
   }
 
   agyActiveRequests += 1;
-  if (runAgyWithPty(prompt, callback)) return;
+  if (runAgyWithPty(prompt, workspaceDir, callback)) return;
   console.log(`[agy] chat using spawn fallback ${AGY_BIN}`);
 
-  const invocation = createAgyPromptInvocation(prompt);
+  const invocation = createAgyPromptInvocation(prompt, workspaceDir);
   const args = createAgyArgs(invocation);
   if (AGY_DEBUG) console.log("[agy] spawn", AGY_BIN, args.map((arg) => (arg === invocation.promptArg ? "[PROMPT]" : arg)).join(" "));
 
-  const child = spawn(AGY_BIN, args, { windowsHide: true, env: process.env });
+  const child = spawn(AGY_BIN, args, { windowsHide: true, env: process.env, cwd: invocation.workspaceDir || process.cwd() });
   const stdout = [];
   const stderr = [];
   let settled = false;
@@ -1026,10 +1030,26 @@ refresh();
 </html>`;
 }
 
+function resolveAgyWorkspaceDir(req) {
+  const value = req.headers["x-workspace-dir"] || req.headers["x-claude-workspace-dir"] || AGY_DEFAULT_WORKSPACE;
+  const workspaceDir = Array.isArray(value) ? value[0] : value;
+  if (!workspaceDir) return "";
+  if (!path.isAbsolute(workspaceDir)) throw new Error("Workspace directory must be an absolute path");
+  if (!fs.existsSync(workspaceDir) || !fs.statSync(workspaceDir).isDirectory()) throw new Error(`Workspace directory does not exist: ${workspaceDir}`);
+  return workspaceDir;
+}
+
 function handleAgyChatCompletions(req, res) {
   if (!authenticateAgy(req, res)) return;
+  let workspaceDir;
+  try {
+    workspaceDir = resolveAgyWorkspaceDir(req);
+  } catch (err) {
+    sendOpenAiError(res, 400, err.message);
+    return;
+  }
   readJsonBody(req, res, (body) => {
-    const prompt = buildAgyPrompt(body);
+    const prompt = buildAgyPrompt(body, workspaceDir);
     if (!prompt) {
       sendOpenAiError(res, 400, "Request must include messages or prompt");
       return;
@@ -1043,14 +1063,14 @@ function handleAgyChatCompletions(req, res) {
       else sendJson(res, 200, openAiCompletionResponse(responseBody, text));
     };
 
-    runAgy(prompt, requestedModel, (err, text) => {
+    runAgy(prompt, requestedModel, workspaceDir, (err, text) => {
       if (!err) {
         finish(requestedModel, text);
         return;
       }
       if (requestedModel === AGY_MODEL && AGY_SECONDARY_MODEL && AGY_SECONDARY_MODEL !== AGY_MODEL) {
         console.error(`agy request failed on ${requestedModel}; retrying ${AGY_SECONDARY_MODEL}:`, err.message);
-        runAgy(prompt, AGY_SECONDARY_MODEL, (fallbackErr, fallbackText) => {
+        runAgy(prompt, AGY_SECONDARY_MODEL, workspaceDir, (fallbackErr, fallbackText) => {
           if (fallbackErr) {
             console.error("agy fallback request failed:", fallbackErr.message);
             sendOpenAiError(res, 502, fallbackErr.message, "provider_error");

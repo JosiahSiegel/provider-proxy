@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a lightweight Node.js reverse proxy (`provider-proxy.js`) for routing AI client requests through a local header/body patching layer before they reach an upstream provider. It is used with OpenCode when a client cannot pass provider-required headers directly, or when an upstream provider needs small request-body compatibility fixes.
 
-`provider-proxy.js` also includes a built-in OpenAI-compatible `/agy` route that wraps the local Antigravity `agy --print` CLI. Reverse-proxy-only use relies on Node.js built-in modules; PTY-backed `agy` support requires installed dependencies so `node-pty` is available.
+`provider-proxy.js` also includes a built-in OpenAI-compatible `/agy` route that wraps the local Antigravity `agy --print` CLI. `/agy` can propagate a workspace directory from request headers or `AGY_DEFAULT_WORKSPACE`: the directory is validated, added to the prompt, passed to `agy` with `--add-dir`, and used as the subprocess `cwd`. Reverse-proxy-only use relies on Node.js built-in modules; PTY-backed `agy` support requires installed dependencies so `node-pty` is available.
 
 ## Running the Proxy
 
@@ -41,6 +41,7 @@ Common optional environment variables:
 - `AGY_MODEL` — model ID returned by `/agy/v1/models` (default: `agy/antigravity`)
 - `AGY_USE_PTY=0` — disable PTY/ConPTY mode for `agy`
 - `AGY_ARG_PROMPT_MAX_BYTES` — prompts above this byte size are written to a temporary file and referenced by a short `agy --print` prompt to avoid OS argument-length limits
+- `AGY_DEFAULT_WORKSPACE` — absolute existing directory used as the `/agy` workspace when the request does not include `X-Workspace-Dir` or `X-Claude-Workspace-Dir`
 
 ### Common Launch Examples
 
@@ -80,26 +81,27 @@ OpenCode then points at `http://127.0.0.1:9999/kimi/v1` or `http://127.0.0.1:999
 ```bash
 PROXY_PORT=9997 node provider-proxy.js
 ```
-The browser UI is `http://127.0.0.1:9997/agy/`. Host clients use `http://127.0.0.1:9997/agy/v1`; Dockerized Manifest uses `http://host.docker.internal:9997/agy/v1`.
+The browser UI is `http://127.0.0.1:9997/agy/`. Host clients use `http://127.0.0.1:9997/agy/v1`; Dockerized Manifest uses `http://host.docker.internal:9997/agy/v1`. Workspace-aware clients may send `X-Workspace-Dir` or `X-Claude-Workspace-Dir` with an absolute existing directory; otherwise `AGY_DEFAULT_WORKSPACE` is used when set.
 
 ## Architecture
 
 `provider-proxy.js` implements a stateless reverse proxy with two forwarded-request code paths plus one built-in local provider path:
 
-1. **Built-in agy path** — requests matching `AGY_PATH_PREFIX` are handled locally before route resolution. This serves the setup UI, health endpoint, model list, and `/v1/chat/completions` backed by `agy --print`.
+1. **Built-in agy path** — requests matching `AGY_PATH_PREFIX` are handled locally before route resolution. This serves the setup UI, health endpoint, model list, and `/v1/chat/completions` backed by `agy --print`. Chat-completion requests can carry a workspace in `X-Workspace-Dir`, `X-Claude-Workspace-Dir`, or `AGY_DEFAULT_WORKSPACE`; the proxy validates that it is an absolute existing directory, includes it in the prompt, passes it as `--add-dir`, and uses it as the subprocess working directory.
 2. **Buffered + patched path** — for `POST`/`PUT`/`PATCH` requests with `application/json` bodies. The proxy buffers the body, applies provider-specific patches, then forwards with an explicit `Content-Length`.
 3. **Stream-through path** — for `GET`/`DELETE` and non-JSON bodies. The request is piped directly to the upstream without modification.
 
 ### Request Pipeline
 
 1. `handleAgyRoute(req, res, pathname)` — claims only paths under `AGY_PATH_PREFIX`, preserving `/openai`, `/kimi`, and other configured upstream routes.
-2. `resolveRoute(reqPath)` — matches the request URL against `TARGET_ROUTES` by `pathPrefix`. Falls back to `DEFAULT_TARGET` (from `TARGET_HOST`) if no route matches. Returns `404` when neither is configured.
-3. `buildOptions(req, route)` — parses the incoming URL, strips the matched `pathPrefix` if `stripPrefix` is enabled, copies headers, injects `INJECTED_HEADERS` (global) merged with `route.headers` (per-route), strips hop-by-hop headers, and sets `host` to `route.host`.
-4. `patchRequestBody(bodyBuf, contentType)` — mutates JSON bodies to fix known provider issues:
+2. `handleAgyChatCompletions(req, res)` — authenticates `/agy/v1/chat/completions`, resolves the workspace from `X-Workspace-Dir`, `X-Claude-Workspace-Dir`, or `AGY_DEFAULT_WORKSPACE`, rejects non-absolute or missing directories with `400`, builds the prompt, and threads `workspaceDir` through `runAgy()`.
+3. `resolveRoute(reqPath)` — matches the request URL against `TARGET_ROUTES` by `pathPrefix`. Falls back to `DEFAULT_TARGET` (from `TARGET_HOST`) if no route matches. Returns `404` when neither is configured.
+4. `buildOptions(req, route)` — parses the incoming URL, strips the matched `pathPrefix` if `stripPrefix` is enabled, copies headers, injects `INJECTED_HEADERS` (global) merged with `route.headers` (per-route), strips hop-by-hop headers, and sets `host` to `route.host`.
+5. `patchRequestBody(bodyBuf, contentType)` — mutates JSON bodies to fix known provider issues:
    - Injects `"reasoning_content": ""` into assistant messages when `thinking` is enabled.
    - Removes unsupported JSON Schema keywords from `tools` (`exclusiveMinimum`, `exclusiveMaximum`, `$ref`, `ref`, `$schema`, `additionalProperties`) for Gemini compatibility.
    - Removes the top-level `thinking` request field for OpenAI-compatible providers that reject it.
-5. `forwardResponse(proxyRes, res)` — pipes the upstream response back to the client, stripping hop-by-hop headers.
+6. `forwardResponse(proxyRes, res)` — pipes the upstream response back to the client, stripping hop-by-hop headers.
 
 The protocol module (`http` vs `https`) is selected per-request via `getRequestModule(route.protocol)`, so different routes can use different protocols.
 
@@ -109,6 +111,7 @@ The protocol module (`http` vs `https`) is selected per-request via `getRequestM
 - Strips proxy-chain headers (`x-forwarded-*`, `x-real-ip`, etc.) before forwarding.
 - Limits request body size to 10MB.
 - Handles client disconnects (`req.on('aborted')`) to prevent upstream resource leaks.
+- `/agy` workspace directories must be absolute and exist before they are passed to the local `agy` process. Treat `X-Workspace-Dir`, `X-Claude-Workspace-Dir`, and `AGY_DEFAULT_WORKSPACE` as local filesystem access controls, especially when `PROXY_BIND` allows non-loopback clients.
 
 ## Files
 

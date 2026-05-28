@@ -7,7 +7,7 @@ A tiny Node.js proxy for AI-provider routing, header injection, local `agy`, loc
 - Generic reverse proxy via `TARGET_HOST` or `TARGETS`.
 - Header injection with `USER_AGENT`, `EXTRA_HEADERS`, and per-route `headers`.
 - JSON body patches for common OpenAI-compatible provider issues.
-- Built-in `/agy/v1` OpenAI-compatible wrapper around local `agy --print`.
+- Built-in `/agy/v1` OpenAI-compatible wrapper around local `agy --print`, with optional workspace directory propagation.
 - Built-in `/ollama/v1` OpenAI-compatible proxy to local, LAN, tailnet, Cloudflare, ngrok, or Kaggle Ollama.
 - Kaggle self-healing keeper: discovers Cloudflare or ngrok tunnel URLs, health-checks Ollama, stops the notebook when unused, wakes on demand, and re-pushes failed notebooks.
 - Loopback bind by default; proxy-chain headers stripped; request body limit is 10MB.
@@ -79,6 +79,8 @@ Run:
 ```
 
 Open `http://127.0.0.1:9999/agy/`, complete setup, then use base URL `http://127.0.0.1:9999/agy/v1` and model `agy/antigravity`. If non-local clients can reach the proxy, set `AGY_PROVIDER_API_KEY` and send it as a bearer token from clients.
+
+For workspace-aware requests, send an absolute existing directory in `X-Workspace-Dir` or `X-Claude-Workspace-Dir`. The proxy validates the directory, prepends it to the prompt as `CURRENT WORKSPACE:`, passes it to `agy` as `--add-dir`, and runs the `agy` subprocess with that directory as `cwd`. Set `AGY_DEFAULT_WORKSPACE` to use a default workspace when the client does not send a header.
 
 ### Local or manual `/ollama` proxy
 
@@ -181,6 +183,7 @@ Idle behavior: when `KAGGLE_IDLE_SHUTDOWN_MINUTES` is greater than `0` (default 
 | `AGY_PROVIDER_API_KEY` | unset | Optional local shared secret required by `/agy/v1` clients. |
 | `AGY_USE_PTY` | auto | Set `0` to force plain pipes instead of PTY/ConPTY. |
 | `AGY_ARG_PROMPT_MAX_BYTES` | `16000` | Larger prompts are written to a temp file and passed by reference. |
+| `AGY_DEFAULT_WORKSPACE` | unset | Absolute existing directory used as the `/agy` workspace when no workspace header is sent. |
 | `AGY_DEBUG` | `0` | Log `agy` subprocess diagnostics. |
 | `AGY_PORT` | `9996` | Standalone `agy-provider.js` port; not used by `provider-proxy.js`. |
 | `OLLAMA_PATH_PREFIX` | `/ollama` | Built-in Ollama route prefix. |
@@ -208,6 +211,7 @@ Idle behavior: when `KAGGLE_IDLE_SHUTDOWN_MINUTES` is greater than `0` (default 
 - Do not commit real API keys, ngrok tokens, Kaggle tokens, tunnel URLs, cookies, or personal account IDs.
 - Keep `PROXY_BIND=127.0.0.1` unless Docker, Tailscale, or another trusted peer must reach it; firewall any widened bind.
 - Keep `/agy`, `/ollama`, and setup UIs private; set `AGY_PROVIDER_API_KEY` or `OLLAMA_PROVIDER_API_KEY` when non-local clients can connect.
+- Only pass trusted local paths in `X-Workspace-Dir`, `X-Claude-Workspace-Dir`, or `AGY_DEFAULT_WORKSPACE`; `/agy` grants the local `agy` process access to that directory with `--add-dir` and uses it as the subprocess working directory.
 
 ## Files
 
@@ -235,7 +239,7 @@ Idle behavior: when `KAGGLE_IDLE_SHUTDOWN_MINUTES` is greater than `0` (default 
 
 Request order:
 
-1. `/agy/*` is handled locally and invokes `agy --print`.
+1. `/agy/*` is handled locally. For `/agy/v1/chat/completions`, the proxy validates `X-Workspace-Dir`, `X-Claude-Workspace-Dir`, or `AGY_DEFAULT_WORKSPACE` when present, builds an `agy --print` prompt, adds a `CURRENT WORKSPACE:` prompt section, passes the workspace with `--add-dir`, and runs the subprocess with that directory as `cwd`.
 2. `/ollama/*` proxies to `OLLAMA_BASE_URL` or the Kaggle keeper's discovered URL. If no upstream is available and the keeper is enabled, the request triggers wake-on-demand and receives `503 Retry-After: 30` while discovery runs.
 3. Other requests resolve against `TARGETS` or `TARGET_HOST`.
 4. JSON mutating requests are buffered, patched, and forwarded with explicit `Content-Length`; other requests stream through.
